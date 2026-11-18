@@ -125,6 +125,28 @@ class Service:
                 db.add(Member(game_id=game_id, user_id=host_id, nickname=host.name))
             game.mode = mode.value
 
+    def set_budget(self, game_id: int, host_id: int, budget: str) -> None:
+        if not budget.strip() or len(budget) > 80:
+            raise ValueError("Бюджет должен быть от 1 до 80 символов")
+        with self.sessions.begin() as db:
+            game = self._game(db, game_id, lock=True)
+            self._require_host(game, host_id)
+            if game.status != "registration":
+                raise InvalidState("После жеребьёвки бюджет менять нельзя")
+            game.budget = budget.strip()
+
+    def set_reminders(self, user_id: int, enabled: bool) -> None:
+        with self.sessions.begin() as db:
+            user = db.get(User, user_id)
+            if user is None:
+                raise AccessDenied("Сначала откройте /start")
+            user.reminders_opt_in = enabled
+            if not enabled:
+                for job in db.scalars(select(Delivery).where(
+                    Delivery.user_id == user_id, Delivery.state == "pending",
+                    Delivery.key.like("reminder:%"))):
+                    job.state = "cancelled"
+
     def add_exclusion(self, game_id: int, host_id: int, giver_id: int, receiver_id: int) -> None:
         with self.sessions.begin() as db:
             game = self._game(db, game_id, lock=True)

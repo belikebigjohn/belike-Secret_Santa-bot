@@ -18,6 +18,7 @@ class Form(StatesGroup):
     dates = State()
     profile = State()
     announcement = State()
+    edit_budget = State()
 
 
 def kb(*items: tuple[str, str]) -> InlineKeyboardMarkup:
@@ -57,6 +58,8 @@ def create_router(service: Service, bot_username: str) -> Router:
                             ("🎲 Жеребьёвка", f"draw:{game_id}"),
                             ("📊 Готовность", f"progress:{game_id}"),
                             ("📣 Объявление", f"announce:{game_id}")])
+            if game.status == "registration":
+                buttons.append(("⚙️ Настройки", f"settings:{game_id}"))
             if game.mode != Mode.BLIND.value:
                 buttons.append(("🔐 Распределение", f"pairs:{game_id}"))
         await screen(message, "\n".join(line for line in lines if line), kb(*buttons))
@@ -236,6 +239,52 @@ def create_router(service: Service, bot_username: str) -> Router:
         except AccessDenied as exc:
             await call.answer(str(exc), show_alert=True)
 
+    @router.callback_query(F.data.startswith("settings:"))
+    async def settings(call: CallbackQuery):
+        game_id = int(call.data.split(":")[1])
+        game_ = service.game(game_id)
+        if game_ is None or game_.host_id != call.from_user.id or game_.status != "registration":
+            await call.answer("Настройки недоступны", show_alert=True)
+            return
+        await call.answer()
+        await screen(call.message, "⚙️ Настройки до жеребьёвки", kb(
+            ("🎁 Играю вслепую", f"setmode:{game_id}:blind"),
+            ("🎩 Играю и всё знаю", f"setmode:{game_id}:open"),
+            ("👑 Только организатор", f"setmode:{game_id}:host"),
+            ("💰 Изменить бюджет", f"editbudget:{game_id}")))
+
+    @router.callback_query(F.data.startswith("setmode:"))
+    async def setmode(call: CallbackQuery):
+        try:
+            _, game_id, mode_ = call.data.split(":")
+            service.set_mode(int(game_id), call.from_user.id, Mode(mode_))
+            await call.answer("Режим изменён")
+        except ValueError as exc:
+            await call.answer(str(exc), show_alert=True)
+
+    @router.callback_query(F.data.startswith("editbudget:"))
+    async def editbudget(call: CallbackQuery, state: FSMContext):
+        game_id = int(call.data.split(":")[1])
+        game_ = service.game(game_id)
+        if game_ is None or game_.host_id != call.from_user.id or game_.status != "registration":
+            await call.answer("Нет доступа", show_alert=True)
+            return
+        await call.answer()
+        await state.update_data(game_id=game_id)
+        await state.set_state(Form.edit_budget)
+        await screen(call.message, "Напишите новый бюджет и валюту.")
+
+    @router.message(Form.edit_budget)
+    async def editbudget_text(message: Message, state: FSMContext):
+        data = await state.get_data()
+        try:
+            service.set_budget(data["game_id"], message.from_user.id, message.text or "")
+        except ValueError as exc:
+            await screen(message, escape(str(exc)))
+            return
+        await state.clear()
+        await show_game(message, data["game_id"], message.from_user.id)
+
     @router.callback_query(F.data.startswith("draw:"))
     async def draw_prompt(call: CallbackQuery):
         game_id = int(call.data.split(":")[1])
@@ -310,5 +359,19 @@ def create_router(service: Service, bot_username: str) -> Router:
     async def help_(message: Message):
         await screen(message, "🎄 Создайте игру через /start, поделитесь приглашением, заполните пожелания "
                      "и проведите жеребьёвку. Вопросы по конкретной игре задавайте её ведущему.")
+
+    @router.message(Command("reminders"))
+    async def reminders(message: Message):
+        parts = (message.text or "").split()
+        if len(parts) != 2 or parts[1] not in {"on", "off"}:
+            await screen(message, "Напоминания: /reminders on или /reminders off. "
+                         "Назначения и объявления ведущего продолжат приходить.")
+            return
+        try:
+            service.set_reminders(message.from_user.id, parts[1] == "on")
+        except AccessDenied as exc:
+            await screen(message, escape(str(exc)))
+            return
+        await screen(message, "Настройка напоминаний сохранена.")
 
     return router

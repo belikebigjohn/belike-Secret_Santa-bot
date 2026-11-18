@@ -107,3 +107,35 @@ def test_announcement_queues_only_own_members(service):
     with service.sessions() as db:
         jobs = db.scalars(select(Delivery)).all()
         assert {job.user_id for job in jobs} == {1, 2, 3, 4}
+
+
+def test_change_mode_and_budget_before_draw(service):
+    game = game_with_players(service)
+    service.set_mode(game.id, 1, Mode.HOST)
+    assert service.member(game.id, 1) is None
+    service.set_budget(game.id, 1, "3000 ₽")
+    assert service.game(game.id).budget == "3000 ₽"
+    service.set_mode(game.id, 1, Mode.OPEN)
+    assert service.member(game.id, 1) is not None
+    service.run_draw(game.id, 1)
+    with pytest.raises(InvalidState):
+        service.set_budget(game.id, 1, "5000 ₽")
+
+
+def test_reminder_opt_out(service):
+    game = service.create_game(1, "Host", "Holiday", Mode.BLIND,
+                               registration_deadline=utcnow() + timedelta(hours=12))
+    service.join(game.id, 2, "Two")
+    service.set_reminders(2, False)
+    assert service.schedule_reminders() == 1
+    with service.sessions() as db:
+        assert {job.user_id for job in db.scalars(select(Delivery))} == {1}
+
+
+def test_opt_out_cancels_pending_reminder(service):
+    service.create_game(1, "Host", "Holiday", Mode.BLIND,
+                        registration_deadline=utcnow() + timedelta(hours=12))
+    service.schedule_reminders()
+    service.set_reminders(1, False)
+    with service.sessions() as db:
+        assert db.scalar(select(Delivery)).state == "cancelled"
