@@ -27,25 +27,32 @@ async def deliver_once(service: Service, bot: Bot) -> int:
         await bot.send_message(user_id, content, parse_mode=parse_mode or None)
     except TelegramForbiddenError:
         with service.sessions.begin() as db:
-            db.get(User, user_id).blocked = True
+            user = db.get(User, user_id)
+            if user is not None:
+                user.blocked = True
             job = db.get(Delivery, job_id)
-            job.state = "failed"
-            job.last_error = "forbidden"
+            if job is not None:
+                job.state = "failed"
+                job.last_error = "forbidden"
     except TelegramRetryAfter as exc:
         with service.sessions.begin() as db:
             job = db.get(Delivery, job_id)
-            job.state = "pending"
-            job.due_at = utcnow() + timedelta(seconds=exc.retry_after)
+            if job is not None:
+                job.state = "pending"
+                job.due_at = utcnow() + timedelta(seconds=exc.retry_after)
     except Exception as exc:  # noqa: BLE001 - Telegram transports can raise various network errors.
         log.warning("Delivery failed: %s", type(exc).__name__)
         with service.sessions.begin() as db:
             job = db.get(Delivery, job_id)
-            job.state = "pending" if job.attempts < 5 else "failed"
-            job.due_at = utcnow() + timedelta(minutes=min(60, 2 ** job.attempts))
-            job.last_error = type(exc).__name__[:160]
+            if job is not None:
+                job.state = "pending" if job.attempts < 5 else "failed"
+                job.due_at = utcnow() + timedelta(minutes=min(60, 2 ** job.attempts))
+                job.last_error = type(exc).__name__[:160]
     else:
         with service.sessions.begin() as db:
-            db.get(Delivery, job_id).state = "sent"
+            job = db.get(Delivery, job_id)
+            if job is not None:
+                job.state = "sent"
     await asyncio.sleep(0.05)
     return 1
 

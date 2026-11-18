@@ -203,14 +203,26 @@ def test_lifecycle_and_transfer(service):
     with pytest.raises(AccessDenied):
         service.run_draw(game.id, 1)
     service.run_draw(game.id, 2)
+    question_id = service.ask_receiver(game.id, 3, "Чай или кофе?")
+    service.announce(game.id, 2, "До встречи", due_at=utcnow() + timedelta(days=2))
     with pytest.raises(InvalidState):
         service.edit_game(game.id, 2, title="Late")
+    with pytest.raises(InvalidState):
+        service.archive_game(game.id, 2)
     service.confirm_received(game.id, 3)
     assert service.member(game.id, 3).received
     service.close_game(game.id, 2)
     assert service.game(game.id).status == "finished"
+    with pytest.raises(AccessDenied):
+        service.archive_game(game.id, 1)
     service.archive_game(game.id, 2)
-    assert service.game(game.id).status == "archived"
+    assert service.game(game.id) is None
+    assert service.game_by_token(game.token) is None
+    assert service.my_games(2) == []
+    with service.sessions() as db:
+        assert db.scalars(select(Assignment).where(Assignment.game_id == game.id)).all() == []
+        assert db.scalars(select(Delivery).where(Delivery.key == f"question:{question_id}")).all() == []
+        assert db.scalars(select(Delivery).where(Delivery.key.like(f"announcement:{game.id}:%"))).all() == []
 
 
 def test_exclusion_removal_and_owner_stats(service):

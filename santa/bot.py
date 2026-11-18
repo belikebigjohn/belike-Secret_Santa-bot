@@ -198,7 +198,7 @@ def create_router(service: Service, bot_username: str) -> Router:
             if game.status == "drawn":
                 buttons.append(("🏁 Завершить игру", f"finish:{game_id}"))
             if game.status == "finished":
-                buttons.append(("🗄 Архивировать", f"archive:{game_id}"))
+                buttons.append(("🗄 Архивировать и удалить", f"archive:{game_id}"))
             if game.mode != Mode.BLIND.value:
                 buttons.append(("🔐 Распределение", f"pairs:{game_id}"))
         buttons.append(("⬅️ Мои игры", "games"))
@@ -915,16 +915,43 @@ def create_router(service: Service, bot_username: str) -> Router:
             await call.answer(str(exc), show_alert=True)
 
     @router.callback_query(F.data.startswith("finish:") | F.data.startswith("archive:"))
-    async def finish_or_archive(call: CallbackQuery):
+    async def finish_or_archive_prompt(call: CallbackQuery):
+        action, game_text = call.data.split(":")
+        game_id = int(game_text)
+        game = service.game(game_id)
+        expected = "drawn" if action == "finish" else "finished"
+        if game is None or game.host_id != call.from_user.id or game.status != expected:
+            await call.answer("Действие недоступно", show_alert=True)
+            return
+        await call.answer()
+        if action == "finish":
+            await screen(call.message,
+                         f"🏁 <b>Завершить игру «{escape(game.title)}»?</b>\n\n"
+                         "Участники больше не смогут менять статус подарка.",
+                         kb(("✅ Подтвердить завершение", f"finishconfirm:{game_id}"),
+                            ("⬅️ Отмена", f"game:{game_id}")))
+        else:
+            await screen(call.message,
+                         f"🗄 <b>Архивировать и удалить «{escape(game.title)}»?</b>\n\n"
+                         "Игра, участники, назначения, вопросы и запланированные сообщения "
+                         "будут удалены без возможности восстановления.",
+                         kb(("✅ Подтвердить удаление", f"archiveconfirm:{game_id}"),
+                            ("⬅️ Отмена", f"game:{game_id}")))
+
+    @router.callback_query(F.data.startswith("finishconfirm:") | F.data.startswith("archiveconfirm:"))
+    async def finish_or_archive_confirm(call: CallbackQuery):
         action, game_text = call.data.split(":")
         game_id = int(game_text)
         try:
-            if action == "finish":
+            if action == "finishconfirm":
                 service.close_game(game_id, call.from_user.id)
+                await call.answer("Игра завершена")
+                await show_game(call.message, game_id, call.from_user.id)
             else:
                 service.archive_game(game_id, call.from_user.id)
-            await call.answer("Сохранено")
-            await show_game(call.message, game_id, call.from_user.id)
+                await call.answer("Игра удалена")
+                await screen(call.message, "🗄 Игра удалена из архива без возможности восстановления.",
+                             kb(("⬅️ Мои игры", "games")))
         except ValueError as exc:
             await call.answer(str(exc), show_alert=True)
 

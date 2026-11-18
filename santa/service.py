@@ -3,7 +3,7 @@ from datetime import UTC, datetime, timedelta
 from html import escape
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import create_engine, func, inspect, select, text
+from sqlalchemy import create_engine, delete, func, inspect, or_, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from santa.draw import draw
@@ -220,12 +220,22 @@ class Service:
             game.status = "finished"
 
     def archive_game(self, game_id: int, host_id: int) -> None:
+        """Permanently remove a finished game and its queued messages."""
         with self.sessions.begin() as db:
             game = self._game(db, game_id, lock=True)
             self._require_host(game, host_id)
             if game.status != "finished":
                 raise InvalidState("Сначала завершите игру")
-            game.status = "archived"
+            question_ids = list(db.scalars(select(Question.id).where(Question.game_id == game_id)))
+            delivery_filters = [Delivery.key.like(f"{prefix}:{game_id}:%") for prefix in
+                                ("draw", "announcement", "reminder", "daily")]
+            for question_id in question_ids:
+                delivery_filters.extend((Delivery.key == f"question:{question_id}",
+                                         Delivery.key == f"answer:{question_id}"))
+            db.execute(delete(Delivery).where(or_(*delivery_filters)))
+            for model in (Question, Assignment, Exclusion, Member):
+                db.execute(delete(model).where(model.game_id == game_id))
+            db.delete(game)
 
     def transfer_host(self, game_id: int, host_id: int, new_host_id: int) -> None:
         with self.sessions.begin() as db:
