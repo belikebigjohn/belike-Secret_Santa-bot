@@ -17,11 +17,13 @@ Telegram-бот для нескольких независимых игр. Ве�
 ## Запуск
 
 1. Создайте бота через [@BotFather](https://t.me/BotFather) и сохраните токен у себя.
-2. Скопируйте `.env.example` в `.env`. Укажите `BOT_TOKEN` и `POSTGRES_PASSWORD` (для Docker). Не отправляйте `.env` в Git.
-3. Запустите `docker compose up --build -d`.
-4. Откройте бота в Telegram и отправьте `/start`.
+2. В этом локальном проекте `.env` уже подготовлен. После нового клонирования запустите `python scripts/init_env.py`.
+3. Откройте `.env` и вставьте токен после `BOT_TOKEN=` одной строкой, без пробелов и кавычек. Остальные строки уже готовы.
+4. Установите зависимости: `python -m pip install -e ".[dev]"` и запустите `python -m santa.main`. Это использует локальную SQLite-базу.
+5. Для запуска с PostgreSQL установите Docker и выполните `docker compose up --build -d`. Пароль базы в `.env` создаётся скриптом автоматически.
+6. Откройте бота в Telegram и отправьте `/start`.
 
-Для локальной разработки установите Python 3.11–3.15 и PostgreSQL, затем `python -m pip install -e ".[dev]"`, установите `DATABASE_URL` и `BOT_TOKEN` в окружении и запустите `python -m santa.main`. Для быстрого локального запуска можно использовать `DATABASE_URL=sqlite:///santa.db`; для эксплуатации нужен PostgreSQL.
+Для локальной разработки нужен Python 3.11–3.15. Конфигурация читается из `.env`; переменные окружения имеют приоритет. Для эксплуатации используйте PostgreSQL через Compose.
 
 Команды разработчика: `python -m pytest`, `python -m ruff check .`.
 
