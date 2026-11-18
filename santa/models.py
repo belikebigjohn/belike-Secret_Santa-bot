@@ -50,6 +50,8 @@ class Game(Base):
     host_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
     title: Mapped[str] = mapped_column(String(120))
     description: Mapped[str] = mapped_column(Text, default="")
+    rules: Mapped[str] = mapped_column(Text, default="")
+    cover_file_id: Mapped[str] = mapped_column(String(255), default="")
     mode: Mapped[str] = mapped_column(String(12))
     budget: Mapped[str] = mapped_column(String(80), default="По договорённости")
     timezone: Mapped[str] = mapped_column(String(64), default="server")
@@ -73,6 +75,18 @@ class Member(Base):
     avoid: Mapped[str] = mapped_column(Text, default="")
     wishlist_url: Mapped[str] = mapped_column(String(500), default="")
     gift_status: Mapped[str] = mapped_column(String(20), default="assigned")
+    received: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class Question(Base):
+    __tablename__ = "questions"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    game_id: Mapped[int] = mapped_column(ForeignKey("games.id"), index=True)
+    giver_id: Mapped[int] = mapped_column(BigInteger)
+    receiver_id: Mapped[int] = mapped_column(BigInteger)
+    text: Mapped[str] = mapped_column(Text)
+    answer: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class Exclusion(Base):

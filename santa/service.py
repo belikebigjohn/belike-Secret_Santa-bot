@@ -1,7 +1,7 @@
 import secrets
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import create_engine, func, select
+from sqlalchemy import create_engine, func, inspect, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from santa.draw import draw
@@ -13,6 +13,7 @@ from santa.models import (
     Game,
     Member,
     Mode,
+    Question,
     ReminderPreference,
     User,
     utcnow,
@@ -35,6 +36,15 @@ class Service:
 
     def create_schema(self) -> None:
         Base.metadata.create_all(self.engine)
+        # Upgrade databases created by earlier releases without dropping game data.
+        with self.engine.begin() as connection:
+            columns = {column["name"] for column in inspect(connection).get_columns("games")}
+            for name, sql_type in (("rules", "TEXT"), ("cover_file_id", "VARCHAR(255)")):
+                if name not in columns:
+                    connection.execute(text(f"ALTER TABLE games ADD COLUMN {name} {sql_type} DEFAULT '' NOT NULL"))
+            columns = {column["name"] for column in inspect(connection).get_columns("members")}
+            if "received" not in columns:
+                connection.execute(text("ALTER TABLE members ADD COLUMN received BOOLEAN DEFAULT FALSE NOT NULL"))
 
     def ensure_user(self, user_id: int, name: str) -> None:
         with self.sessions.begin() as db:
@@ -150,6 +160,127 @@ class Service:
                 raise InvalidState("После жеребьёвки бюджет менять нельзя")
             game.budget = budget.strip()
 
+    def edit_game(self, game_id: int, host_id: int, **fields: str) -> None:
+        limits = {"title": 120, "description": 2000, "rules": 3000, "cover_file_id": 255}
+        if not fields or not fields.keys() <= limits.keys():
+            raise ValueError("Недопустимое поле игры")
+        with self.sessions.begin() as db:
+            game = self._game(db, game_id, lock=True)
+            self._require_host(game, host_id)
+            if game.status != "registration":
+                raise InvalidState("Редактирование доступно до жеребьёвки")
+            for key, value in fields.items():
+                value = value.strip()
+                if len(value) > limits[key] or (key == "title" and not value):
+                    raise ValueError("Проверьте длину текста")
+                setattr(game, key, value)
+
+    def remove_exclusion(self, game_id: int, host_id: int, giver_id: int, receiver_id: int) -> None:
+        with self.sessions.begin() as db:
+            game = self._game(db, game_id, lock=True)
+            self._require_host(game, host_id)
+            if game.status != "registration":
+                raise InvalidState("После жеребьёвки ограничения менять нельзя")
+            exclusion = db.scalar(select(Exclusion).where(Exclusion.game_id == game_id,
+                Exclusion.giver_id == giver_id, Exclusion.receiver_id == receiver_id))
+            if exclusion:
+                db.delete(exclusion)
+
+    def exclusions(self, game_id: int, host_id: int) -> list[Exclusion]:
+        with self.sessions() as db:
+            self._require_host(self._game(db, game_id), host_id)
+            return list(db.scalars(select(Exclusion).where(Exclusion.game_id == game_id)))
+
+    def close_game(self, game_id: int, host_id: int) -> None:
+        with self.sessions.begin() as db:
+            game = self._game(db, game_id, lock=True)
+            self._require_host(game, host_id)
+            if game.status != "drawn":
+                raise InvalidState("Завершить можно только игру после жеребьёвки")
+            game.status = "finished"
+
+    def archive_game(self, game_id: int, host_id: int) -> None:
+        with self.sessions.begin() as db:
+            game = self._game(db, game_id, lock=True)
+            self._require_host(game, host_id)
+            if game.status != "finished":
+                raise InvalidState("Сначала завершите игру")
+            game.status = "archived"
+
+    def transfer_host(self, game_id: int, host_id: int, new_host_id: int) -> None:
+        with self.sessions.begin() as db:
+            game = self._game(db, game_id, lock=True)
+            self._require_host(game, host_id)
+            if game.status != "registration":
+                raise InvalidState("Передача роли доступна до жеребьёвки")
+            if not db.scalar(select(Member.id).where(Member.game_id == game_id,
+                                                       Member.user_id == new_host_id)):
+                raise ValueError("Новый ведущий должен участвовать в игре")
+            if game.mode == Mode.HOST.value:
+                raise InvalidState("В режиме организатора смените режим перед передачей")
+            game.host_id = new_host_id
+
+    def set_marketing(self, user_id: int, enabled: bool) -> None:
+        with self.sessions.begin() as db:
+            user = db.get(User, user_id)
+            if user is None:
+                raise AccessDenied("Сначала откройте /start")
+            user.marketing_opt_in = enabled
+
+    def marketing_enabled(self, user_id: int) -> bool:
+        with self.sessions() as db:
+            user = db.get(User, user_id)
+            return bool(user and user.marketing_opt_in)
+
+    def ask_receiver(self, game_id: int, giver_id: int, question: str) -> int:
+        question = question.strip()
+        if not 1 <= len(question) <= 1000:
+            raise ValueError("Вопрос должен быть от 1 до 1000 символов")
+        with self.sessions.begin() as db:
+            game = self._game(db, game_id)
+            if game.status != "drawn":
+                raise InvalidState("Вопросы доступны после жеребьёвки")
+            assignment = db.scalar(select(Assignment).where(Assignment.game_id == game_id,
+                                                            Assignment.giver_id == giver_id))
+            if assignment is None:
+                raise AccessDenied("Нет назначения в этой игре")
+            item = Question(game_id=game_id, giver_id=giver_id,
+                            receiver_id=assignment.receiver_id, text=question)
+            db.add(item)
+            db.flush()
+            db.add(Delivery(key=f"question:{item.id}", user_id=item.receiver_id,
+                            text=f"🎭 Анонимный вопрос по игре «{game.title}»:\n{question}\n\nОтветьте через /start → игра → Вопросы."))
+            return item.id
+
+    def incoming_questions(self, game_id: int, user_id: int) -> list[Question]:
+        with self.sessions() as db:
+            return list(db.scalars(select(Question).where(Question.game_id == game_id,
+                        Question.receiver_id == user_id, Question.answer == "").order_by(Question.id)))
+
+    def answer_question(self, question_id: int, user_id: int, answer: str) -> None:
+        answer = answer.strip()
+        if not 1 <= len(answer) <= 1000:
+            raise ValueError("Ответ должен быть от 1 до 1000 символов")
+        with self.sessions.begin() as db:
+            item = db.get(Question, question_id)
+            if item is None or item.receiver_id != user_id:
+                raise AccessDenied("Вопрос не найден")
+            if item.answer:
+                raise InvalidState("Ответ уже отправлен")
+            item.answer = answer
+            game = self._game(db, item.game_id)
+            db.add(Delivery(key=f"answer:{item.id}", user_id=item.giver_id,
+                            text=f"🎭 Ответ получателя в игре «{game.title}»:\n{answer}"))
+
+    def confirm_received(self, game_id: int, user_id: int) -> None:
+        with self.sessions.begin() as db:
+            game = self._game(db, game_id)
+            member = db.scalar(select(Member).where(Member.game_id == game_id,
+                                                     Member.user_id == user_id))
+            if member is None or game.status not in {"drawn", "finished"}:
+                raise AccessDenied("Подтверждение недоступно")
+            member.received = True
+
     def set_reminders(self, user_id: int, enabled: bool) -> None:
         with self.sessions.begin() as db:
             user = db.get(User, user_id)
@@ -186,6 +317,8 @@ class Service:
                     job.state = "cancelled"
 
     def add_exclusion(self, game_id: int, host_id: int, giver_id: int, receiver_id: int) -> None:
+        if giver_id == receiver_id:
+            raise ValueError("Нельзя запретить пару участника с самим собой")
         with self.sessions.begin() as db:
             game = self._game(db, game_id, lock=True)
             self._require_host(game, host_id)
@@ -257,9 +390,12 @@ class Service:
                 Member.game_id == game_id, Member.gift_status.in_(["ready", "sent", "given"])))
             return total or 0, ready or 0
 
-    def announce(self, game_id: int, host_id: int, text: str) -> int:
+    def announce(self, game_id: int, host_id: int, text: str,
+                 due_at: datetime | None = None) -> int:
         if not text.strip() or len(text) > 3000:
             raise ValueError("Сообщение должно быть от 1 до 3000 символов")
+        if due_at is not None and due_at <= utcnow():
+            raise ValueError("Время отправки должно быть в будущем")
         with self.sessions.begin() as db:
             game = self._game(db, game_id)
             self._require_host(game, host_id)
@@ -267,7 +403,8 @@ class Service:
             batch = secrets.token_hex(8)
             for member in members:
                 db.add(Delivery(key=f"announcement:{game_id}:{batch}:{member.user_id}",
-                                user_id=member.user_id, text=f"📣 {game.title}\n{text.strip()}"))
+                                user_id=member.user_id, text=f"📣 {game.title}\n{text.strip()}",
+                                due_at=due_at or utcnow()))
             return len(members)
 
     def schedule_reminders(self, now: datetime | None = None) -> int:
@@ -312,6 +449,19 @@ class Service:
 
     def is_owner(self, user_id: int) -> bool:
         return user_id in self.owner_ids
+
+    def owner_stats(self, user_id: int) -> dict[str, int]:
+        if not self.is_owner(user_id):
+            raise AccessDenied("Доступ закрыт")
+        with self.sessions() as db:
+            return {
+                "users": db.scalar(select(func.count()).select_from(User)) or 0,
+                "games": db.scalar(select(func.count()).select_from(Game)) or 0,
+                "active": db.scalar(select(func.count()).select_from(Game).where(
+                    Game.status.in_(["registration", "drawn"]))) or 0,
+                "deliveries_pending": db.scalar(select(func.count()).select_from(Delivery).where(
+                    Delivery.state == "pending")) or 0,
+            }
 
     @staticmethod
     def _game(db: Session, game_id: int, lock: bool = False) -> Game:

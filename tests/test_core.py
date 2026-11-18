@@ -169,3 +169,67 @@ def test_daily_toggle_cancels_waiting_job(service):
     with service.sessions() as db:
         job = db.scalar(select(Delivery).where(Delivery.key.like("daily:%")))
         assert job.state == "cancelled"
+
+
+def test_questions_are_anonymous_and_answer_is_scoped(service):
+    game = game_with_players(service)
+    assignments = service.run_draw(game.id, 1)
+    giver, receiver = next(iter(assignments.items()))
+    question_id = service.ask_receiver(game.id, giver, "Какой цвет выбрать?")
+    incoming = service.incoming_questions(game.id, receiver)
+    assert [item.id for item in incoming] == [question_id]
+    with service.sessions() as db:
+        job = db.scalar(select(Delivery).where(Delivery.key == f"question:{question_id}"))
+        assert job.user_id == receiver
+        assert str(giver) not in job.text
+    with pytest.raises(AccessDenied):
+        service.answer_question(question_id, 99, "Синий")
+    service.answer_question(question_id, receiver, "Синий")
+    assert service.incoming_questions(game.id, receiver) == []
+    with service.sessions() as db:
+        reply = db.scalar(select(Delivery).where(Delivery.key == f"answer:{question_id}"))
+        assert reply.user_id == giver
+    with pytest.raises(InvalidState):
+        service.answer_question(question_id, receiver, "Красный")
+
+
+def test_lifecycle_and_transfer(service):
+    game = game_with_players(service)
+    service.edit_game(game.id, 1, description="Party", rules="No spoilers")
+    assert service.game(game.id).rules == "No spoilers"
+    with pytest.raises(AccessDenied):
+        service.edit_game(game.id, 2, title="Hijacked")
+    service.transfer_host(game.id, 1, 2)
+    with pytest.raises(AccessDenied):
+        service.run_draw(game.id, 1)
+    service.run_draw(game.id, 2)
+    with pytest.raises(InvalidState):
+        service.edit_game(game.id, 2, title="Late")
+    service.confirm_received(game.id, 3)
+    assert service.member(game.id, 3).received
+    service.close_game(game.id, 2)
+    assert service.game(game.id).status == "finished"
+    service.archive_game(game.id, 2)
+    assert service.game(game.id).status == "archived"
+
+
+def test_exclusion_removal_and_owner_stats(service):
+    game = game_with_players(service)
+    service.add_exclusion(game.id, 1, 2, 3)
+    assert len(service.exclusions(game.id, 1)) == 1
+    service.remove_exclusion(game.id, 1, 2, 3)
+    assert service.exclusions(game.id, 1) == []
+    with pytest.raises(AccessDenied):
+        service.owner_stats(1)
+    assert service.owner_stats(99)["games"] == 1
+
+
+def test_scheduled_announcement_waits_for_due_time(service):
+    game = game_with_players(service)
+    due = utcnow() + timedelta(days=2)
+    assert service.announce(game.id, 1, "Встречаемся у ёлки", due_at=due) == 4
+    with service.sessions() as db:
+        jobs = db.scalars(select(Delivery)).all()
+        assert all(job.due_at == due for job in jobs)
+    with pytest.raises(ValueError):
+        service.announce(game.id, 1, "Поздно", due_at=utcnow() - timedelta(seconds=1))

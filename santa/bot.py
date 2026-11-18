@@ -28,7 +28,12 @@ class Form(StatesGroup):
     celebration_date = State()
     profile = State()
     announcement = State()
+    announcement_date = State()
     edit_budget = State()
+    edit_game = State()
+    ask = State()
+    answer = State()
+    transfer = State()
 
 
 POSTER = Path(__file__).resolve().parent.parent / "assets" / "host_modes.png"
@@ -63,19 +68,20 @@ def create_router(service: Service, bot_username: str) -> Router:
             pass
 
     async def screen(message: Message, text: str, keyboard: InlineKeyboardMarkup | None = None,
-                     art: Path | None = None) -> Message:
+                     art: Path | str | None = None) -> Message:
         # Telegram captions are limited to 1024 characters; long profiles stay text-only.
-        if len(text) > 1000 or (art is not None and not art.is_file()):
+        if len(text) > 1000 or (isinstance(art, Path) and not art.is_file()):
             art = None
+        media = FSInputFile(art) if isinstance(art, Path) else art
         if message.from_user and message.from_user.is_bot:
             try:
                 if art is not None:
                     if message.photo:
                         return await message.edit_media(
-                            media=InputMediaPhoto(media=FSInputFile(art), caption=text,
+                            media=InputMediaPhoto(media=media, caption=text,
                                                   parse_mode="HTML"),
                             reply_markup=keyboard)
-                    replacement = await message.answer_photo(FSInputFile(art), caption=text,
+                    replacement = await message.answer_photo(media, caption=text,
                                                              reply_markup=keyboard, parse_mode="HTML")
                     await safe_delete(message)
                     return replacement
@@ -91,7 +97,7 @@ def create_router(service: Service, bot_username: str) -> Router:
                 if "message is not modified" in str(exc).lower():
                     return message
         if art is not None:
-            replacement = await message.answer_photo(FSInputFile(art), caption=text,
+            replacement = await message.answer_photo(media, caption=text,
                                                      reply_markup=keyboard, parse_mode="HTML")
         else:
             replacement = await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
@@ -137,8 +143,10 @@ def create_router(service: Service, bot_username: str) -> Router:
                  f"<i>{MODE_NAMES[game.mode]}</i>"]
         if game.description:
             lines.extend(["", escape(game.description[:300])])
+        if game.rules:
+            lines.extend(["", f"📜 <b>Правила:</b> {escape(game.rules[:300])}"])
         lines.extend(["", f"💰 <b>Бюджет:</b> {escape(game.budget)}",
-                      f"🎲 <b>Статус:</b> {'регистрация' if game.status == 'registration' else 'жеребьёвка проведена'}"])
+                       f"🎲 <b>Статус:</b> { {'registration': 'регистрация', 'drawn': 'жеребьёвка проведена', 'finished': 'завершена', 'archived': 'архив'}[game.status] }"])
         if total is not None:
             lines.extend(["", f"👥 <b>Участников:</b> {total}",
                           f"🔗 <b>Приглашение:</b> <code>https://t.me/{bot_username}?start=join_{game.token}</code>"])
@@ -149,17 +157,25 @@ def create_router(service: Service, bot_username: str) -> Router:
         buttons = []
         if member:
             buttons.extend([("📝 Анкета", f"profile:{game_id}"), ("🎅 Моя миссия", f"mission:{game_id}")])
+            if game.status == "drawn":
+                buttons.extend([("🎭 Вопросы", f"questions:{game_id}"),
+                                ("📦 Подтвердить получение", f"received:{game_id}")])
         if game.host_id == viewer_id:
             buttons.extend([("👥 Участники", f"members:{game_id}"),
-                            ("🎲 Жеребьёвка", f"draw:{game_id}"),
                             ("📊 Готовность", f"progress:{game_id}"),
                             ("📣 Объявление", f"announce:{game_id}")])
             if game.status == "registration":
-                buttons.append(("⚙️ Настройки", f"settings:{game_id}"))
+                buttons.extend([("⚙️ Настройки", f"settings:{game_id}"),
+                                ("🎲 Жеребьёвка", f"draw:{game_id}")])
+            if game.status == "drawn":
+                buttons.append(("🏁 Завершить игру", f"finish:{game_id}"))
+            if game.status == "finished":
+                buttons.append(("🗄 Архивировать", f"archive:{game_id}"))
             if game.mode != Mode.BLIND.value:
                 buttons.append(("🔐 Распределение", f"pairs:{game_id}"))
         buttons.append(("⬅️ Мои игры", "games"))
-        return await screen(message, "\n".join(lines), kb(*buttons), art=WELCOME_ART)
+        return await screen(message, "\n".join(lines), kb(*buttons),
+                            art=game.cover_file_id or WELCOME_ART)
 
     @router.message(CommandStart())
     async def start(message: Message, state: FSMContext):
@@ -170,9 +186,10 @@ def create_router(service: Service, bot_username: str) -> Router:
             game = service.game_by_token(token)
             if game:
                 await screen(message, f"🎄 <b>{escape(game.title)}</b>\n{escape(game.description)}\n"
-                             f"Бюджет: {escape(game.budget)}",
+                             f"Бюджет: {escape(game.budget)}\n"
+                             f"Правила: {escape(game.rules or 'не указаны')}",
                              kb(("Участвовать", f"join:{game.id}"),
-                                ("⬅️ Главное меню", "home")), art=WELCOME_ART)
+                                ("⬅️ Главное меню", "home")), art=game.cover_file_id or WELCOME_ART)
                 return
         await screen(message, "🎅 <b>Тайный Санта</b>\n\nСоздайте игру или откройте свои игры.",
                      kb(("🎄 Создать игру", "create"), ("🎁 Мои игры", "games"),
@@ -399,8 +416,24 @@ def create_router(service: Service, bot_username: str) -> Router:
                      f"<b>Пожелания:</b> {escape(receiver.wishes or 'не указаны')}\n\n"
                      f"<b>Не дарить:</b> {escape(receiver.avoid or 'не указано')}\n\n"
                      f"<b>Бюджет:</b> {escape(game_.budget)}",
-                     kb(("✅ Подарок готов", f"ready:{game_id}"),
+                      kb(("🛍 Выбираю подарок", f"giftstatus:{game_id}:choosing"),
+                         ("🛒 Подарок куплен", f"giftstatus:{game_id}:bought"),
+                         ("✅ Подарок готов", f"giftstatus:{game_id}:ready"),
+                         ("📮 Подарок отправлен", f"giftstatus:{game_id}:sent"),
+                         ("🎁 Подарок вручён", f"giftstatus:{game_id}:given"),
+                         ("🎭 Задать вопрос", f"ask:{game_id}"),
                         ("⬅️ К игре", f"game:{game_id}")), art=MISSION_ART)
+
+    @router.callback_query(F.data.startswith("giftstatus:"))
+    async def gift_status(call: CallbackQuery):
+        _, game_text, status = call.data.split(":")
+        try:
+            service.set_gift_status(int(game_text), call.from_user.id, status)
+            await call.answer("Статус подарка сохранён")
+            await screen(call.message, "✅ Статус подарка обновлён.",
+                         kb(("⬅️ К миссии", f"mission:{game_text}")))
+        except ValueError as exc:
+            await call.answer(str(exc), show_alert=True)
 
     @router.callback_query(F.data.startswith("ready:"))
     async def ready(call: CallbackQuery):
@@ -442,6 +475,12 @@ def create_router(service: Service, bot_username: str) -> Router:
             ("🎩 Играю и всё знаю", f"setmode:{game_id}:open"),
             ("👑 Только организатор", f"setmode:{game_id}:host"),
             ("💰 Изменить бюджет", f"editbudget:{game_id}"),
+            ("✏️ Название", f"editgame:{game_id}:title"),
+            ("📝 Описание", f"editgame:{game_id}:description"),
+            ("📜 Правила", f"editgame:{game_id}:rules"),
+            ("🖼 Обложка", f"editgame:{game_id}:cover_file_id"),
+            ("🚫 Запреты пар", f"exclusions:{game_id}"),
+            ("👑 Передать роль", f"transfer:{game_id}"),
             ("⬅️ К игре", f"game:{game_id}")))
 
     @router.callback_query(F.data.startswith("setmode:"))
@@ -549,18 +588,59 @@ def create_router(service: Service, bot_username: str) -> Router:
             await call.answer("Нет доступа", show_alert=True)
             return
         await call.answer()
-        await state.update_data(game_id=game_id)
+        await screen(call.message, "📣 <b>Объявление</b>\n\nКогда отправить сообщение?",
+                     kb(("Сейчас", f"annnow:{game_id}"),
+                        ("Запланировать", f"annlater:{game_id}"),
+                        ("⬅️ К игре", f"game:{game_id}")))
+
+    @router.callback_query(F.data.startswith("annnow:"))
+    async def announce_now(call: CallbackQuery, state: FSMContext):
+        game_id = int(call.data.split(":")[1])
+        game_ = service.game(game_id)
+        if game_ is None or game_.host_id != call.from_user.id:
+            await call.answer("Нет доступа", show_alert=True)
+            return
+        await call.answer()
+        await state.update_data(game_id=game_id, announcement_due=None)
         await state.set_state(Form.announcement)
-        panel = await screen(call.message,
-                             "📣 <b>Объявление</b>\n\nНапишите текст для участников игры (до 3000 символов).",
+        panel = await screen(call.message, "📣 Напишите объявление (до 3000 символов).",
                              kb(("⬅️ К игре", f"game:{game_id}")))
         await remember(state, panel)
+
+    @router.callback_query(F.data.startswith("annlater:"))
+    async def announce_later(call: CallbackQuery, state: FSMContext):
+        game_id = int(call.data.split(":")[1])
+        game_ = service.game(game_id)
+        if game_ is None or game_.host_id != call.from_user.id:
+            await call.answer("Нет доступа", show_alert=True)
+            return
+        await call.answer()
+        await state.update_data(game_id=game_id)
+        await state.set_state(Form.announcement_date)
+        panel = await screen(call.message,
+                             "📅 Введите дату отправки в формате ДД.ММ.ГГГГ. Время — 18:00 по времени сервера.",
+                             kb(("⬅️ К игре", f"game:{game_id}")))
+        await remember(state, panel)
+
+    @router.message(Form.announcement_date)
+    async def announcement_date(message: Message, state: FSMContext):
+        try:
+            due = local_date(message.text or "")
+            if due <= utcnow():
+                raise ValueError
+        except ValueError:
+            await update_panel(message, state, "Введите будущую дату: ДД.ММ.ГГГГ.")
+            return
+        await state.update_data(announcement_due=due)
+        await state.set_state(Form.announcement)
+        await update_panel(message, state, "📣 Напишите объявление (до 3000 символов).")
 
     @router.message(Form.announcement)
     async def announce_text(message: Message, state: FSMContext):
         data = await state.get_data()
         try:
-            count = service.announce(data["game_id"], message.from_user.id, message.text or "")
+            count = service.announce(data["game_id"], message.from_user.id, message.text or "",
+                                     due_at=data.get("announcement_due"))
         except ValueError as exc:
             await update_panel(message, state, escape(str(exc)),
                                kb(("⬅️ К игре", f"game:{data['game_id']}")))
@@ -577,8 +657,10 @@ def create_router(service: Service, bot_username: str) -> Router:
         enabled = service.daily_reminders_enabled(call.from_user.id)
         await screen(call.message, "⚙️ <b>Мои напоминания</b>\n\n"
                      f"Ежедневное напоминание о подарке: <b>{'включено' if enabled else 'выключено'}</b>.\n\n"
-                     "<i>Приходит после 09:00 по времени сервера, пока подарок не готов.</i>",
+                     "<i>Приходит после 09:00 по времени сервера, пока подарок не готов.</i>\n\n"
+                     f"Новости бота: <b>{'включены' if service.marketing_enabled(call.from_user.id) else 'выключены'}</b>.",
                      kb(("🔕 Выключить" if enabled else "🔔 Включить", "daily:toggle"),
+                        ("📬 Настроить новости", "marketing:toggle"),
                         ("⬅️ Главное меню", "home")))
 
     @router.callback_query(F.data == "daily:toggle")
@@ -594,6 +676,21 @@ def create_router(service: Service, bot_username: str) -> Router:
                      f"Ежедневное напоминание о подарке: <b>{'включено' if enabled else 'выключено'}</b>.\n\n"
                      "<i>Приходит после 09:00 по времени сервера, пока подарок не готов.</i>",
                      kb(("🔕 Выключить" if enabled else "🔔 Включить", "daily:toggle"),
+                        ("📬 Настроить новости", "marketing:toggle"),
+                        ("⬅️ Главное меню", "home")))
+
+    @router.callback_query(F.data == "marketing:toggle")
+    async def marketing_toggle(call: CallbackQuery):
+        enabled = not service.marketing_enabled(call.from_user.id)
+        try:
+            service.set_marketing(call.from_user.id, enabled)
+        except AccessDenied as exc:
+            await call.answer(str(exc), show_alert=True)
+            return
+        await call.answer("Сохранено")
+        await screen(call.message,
+                     f"📬 Новости бота {'включены' if enabled else 'выключены'}. Это не влияет на сообщения по вашим играм.",
+                     kb(("📬 Изменить настройку", "marketing:toggle"),
                         ("⬅️ Главное меню", "home")))
 
     @router.message(Command("admin"))
@@ -601,7 +698,12 @@ def create_router(service: Service, bot_username: str) -> Router:
         if not service.is_owner(message.from_user.id):
             await screen(message, "Доступ закрыт.")
             return
-        await screen(message, "🛠 Владелец бота. Расширенная панель запланирована в ROADMAP.md.")
+        stats = service.owner_stats(message.from_user.id)
+        await screen(message, "🛠 <b>Сводка бота</b>\n\n"
+                     f"Пользователей: {stats['users']}\n"
+                     f"Игр: {stats['games']}\n"
+                     f"Активных игр: {stats['active']}\n"
+                     f"Сообщений в очереди: {stats['deliveries_pending']}")
 
     @router.message(Command("help"))
     async def help_(message: Message):
@@ -621,5 +723,195 @@ def create_router(service: Service, bot_username: str) -> Router:
             await screen(message, escape(str(exc)))
             return
         await screen(message, "Настройка напоминаний сохранена.")
+
+    @router.callback_query(F.data.startswith("editgame:"))
+    async def edit_game_prompt(call: CallbackQuery, state: FSMContext):
+        _, game_id_text, field = call.data.split(":")
+        game_id = int(game_id_text)
+        game_ = service.game(game_id)
+        if game_ is None or game_.host_id != call.from_user.id or game_.status != "registration":
+            await call.answer("Настройки недоступны", show_alert=True)
+            return
+        await call.answer()
+        await state.update_data(game_id=game_id, field=field)
+        await state.set_state(Form.edit_game)
+        prompt = "Отправьте фотографию" if field == "cover_file_id" else "Отправьте новый текст (для очистки — «-»)"
+        panel = await screen(call.message, f"✏️ <b>Настройка игры</b>\n\n{prompt}.",
+                             kb(("⬅️ К настройкам", f"settings:{game_id}")))
+        await remember(state, panel)
+
+    @router.message(Form.edit_game)
+    async def edit_game_text(message: Message, state: FSMContext):
+        data = await state.get_data()
+        try:
+            if data["field"] == "cover_file_id" and not message.photo and message.text != "-":
+                raise ValueError("Отправьте фотографию или «-» для удаления обложки")
+            value = message.photo[-1].file_id if data["field"] == "cover_file_id" and message.photo else message.text or ""
+            service.edit_game(data["game_id"], message.from_user.id,
+                              **{data["field"]: "" if value == "-" else value})
+        except ValueError as exc:
+            await update_panel(message, state, escape(str(exc)),
+                               kb(("⬅️ К настройкам", f"settings:{data['game_id']}")))
+            return
+        await update_panel(message, state, "✅ Игра обновлена.",
+                           kb(("⬅️ К игре", f"game:{data['game_id']}")))
+        await state.clear()
+
+    @router.callback_query(F.data.startswith("exclusions:"))
+    async def exclusions(call: CallbackQuery):
+        game_id = int(call.data.split(":")[1])
+        try:
+            people = service.members(game_id, call.from_user.id)
+            existing = service.exclusions(game_id, call.from_user.id)
+            names = {p.user_id: p.nickname for p in people}
+            lines = [f"• {escape(names.get(e.giver_id, '?'))} → {escape(names.get(e.receiver_id, '?'))}"
+                     for e in existing]
+            buttons = [(f"➕ От {p.nickname[:25]}", f"exgiver:{game_id}:{p.user_id}") for p in people[:30]]
+            buttons += [(f"✖ {names.get(e.giver_id, '?')[:12]} → {names.get(e.receiver_id, '?')[:12]}",
+                         f"exremove:{game_id}:{e.giver_id}:{e.receiver_id}") for e in existing[:30]]
+            await call.answer()
+            await screen(call.message, "🚫 <b>Запреты направленных пар</b>\n\n" +
+                         ("\n".join(lines) or "Пока нет запретов."),
+                         kb(*buttons, ("⬅️ К настройкам", f"settings:{game_id}")))
+        except ValueError as exc:
+            await call.answer(str(exc), show_alert=True)
+
+    @router.callback_query(F.data.startswith("exgiver:"))
+    async def ex_giver(call: CallbackQuery):
+        _, game_text, giver_text = call.data.split(":")
+        game_id, giver_id = int(game_text), int(giver_text)
+        try:
+            people = service.members(game_id, call.from_user.id)
+            if giver_id not in {p.user_id for p in people}:
+                raise ValueError("Участник не найден")
+            await call.answer()
+            await screen(call.message, "Кому нельзя дарить подарок?",
+                         kb(*[(p.nickname[:35], f"exadd:{game_id}:{giver_id}:{p.user_id}")
+                              for p in people if p.user_id != giver_id],
+                            ("⬅️ К запретам", f"exclusions:{game_id}")))
+        except ValueError as exc:
+            await call.answer(str(exc), show_alert=True)
+
+    @router.callback_query(F.data.startswith("exadd:") | F.data.startswith("exremove:"))
+    async def ex_change(call: CallbackQuery):
+        action, game_text, giver_text, receiver_text = call.data.split(":")
+        game_id = int(game_text)
+        try:
+            if action == "exadd":
+                service.add_exclusion(game_id, call.from_user.id, int(giver_text), int(receiver_text))
+            else:
+                service.remove_exclusion(game_id, call.from_user.id, int(giver_text), int(receiver_text))
+            await call.answer("Сохранено")
+            await screen(call.message, "🚫 Запреты обновлены.",
+                         kb(("⬅️ К запретам", f"exclusions:{game_id}")))
+        except ValueError as exc:
+            await call.answer(str(exc), show_alert=True)
+
+    @router.callback_query(F.data.startswith("questions:"))
+    async def questions(call: CallbackQuery):
+        game_id = int(call.data.split(":")[1])
+        if service.member(game_id, call.from_user.id) is None:
+            await call.answer("Нет доступа", show_alert=True)
+            return
+        incoming = service.incoming_questions(game_id, call.from_user.id)
+        await call.answer()
+        await screen(call.message, "🎭 <b>Анонимные вопросы</b>\n\n" +
+                     ("\n".join(f"#{q.id}: {escape(q.text[:100])}" for q in incoming[:10])
+                      or "Новых вопросов нет."),
+                     kb(("✉️ Спросить получателя", f"ask:{game_id}"),
+                        *[(f"Ответить на #{q.id}", f"answer:{q.id}") for q in incoming[:10]],
+                        ("⬅️ К игре", f"game:{game_id}")))
+
+    @router.callback_query(F.data.startswith("ask:"))
+    async def ask_prompt(call: CallbackQuery, state: FSMContext):
+        game_id = int(call.data.split(":")[1])
+        if service.assignment(game_id, call.from_user.id) is None:
+            await call.answer("Нет назначения", show_alert=True)
+            return
+        await call.answer()
+        await state.update_data(game_id=game_id)
+        await state.set_state(Form.ask)
+        panel = await screen(call.message, "🎭 Напишите вопрос получателю. Ваше имя не будет показано.",
+                             kb(("⬅️ К вопросам", f"questions:{game_id}")))
+        await remember(state, panel)
+
+    @router.message(Form.ask)
+    async def ask_text(message: Message, state: FSMContext):
+        data = await state.get_data()
+        try:
+            service.ask_receiver(data["game_id"], message.from_user.id, message.text or "")
+        except ValueError as exc:
+            await update_panel(message, state, escape(str(exc)))
+            return
+        await update_panel(message, state, "✅ Вопрос отправлен анонимно.",
+                           kb(("⬅️ К игре", f"game:{data['game_id']}")))
+        await state.clear()
+
+    @router.callback_query(F.data.startswith("answer:"))
+    async def answer_prompt(call: CallbackQuery, state: FSMContext):
+        question_id = int(call.data.split(":")[1])
+        await call.answer()
+        await state.update_data(question_id=question_id)
+        await state.set_state(Form.answer)
+        panel = await screen(call.message, "🎭 Напишите ответ на вопрос.")
+        await remember(state, panel)
+
+    @router.message(Form.answer)
+    async def answer_text(message: Message, state: FSMContext):
+        data = await state.get_data()
+        try:
+            service.answer_question(data["question_id"], message.from_user.id, message.text or "")
+        except ValueError as exc:
+            await update_panel(message, state, escape(str(exc)))
+            return
+        await update_panel(message, state, "✅ Ответ отправлен.")
+        await state.clear()
+
+    @router.callback_query(F.data.startswith("received:"))
+    async def received(call: CallbackQuery):
+        game_id = int(call.data.split(":")[1])
+        try:
+            service.confirm_received(game_id, call.from_user.id)
+            await call.answer("Получение подтверждено")
+            await screen(call.message, "📦 Подарок получен!", kb(("⬅️ К игре", f"game:{game_id}")))
+        except ValueError as exc:
+            await call.answer(str(exc), show_alert=True)
+
+    @router.callback_query(F.data.startswith("finish:") | F.data.startswith("archive:"))
+    async def finish_or_archive(call: CallbackQuery):
+        action, game_text = call.data.split(":")
+        game_id = int(game_text)
+        try:
+            if action == "finish":
+                service.close_game(game_id, call.from_user.id)
+            else:
+                service.archive_game(game_id, call.from_user.id)
+            await call.answer("Сохранено")
+            await show_game(call.message, game_id, call.from_user.id)
+        except ValueError as exc:
+            await call.answer(str(exc), show_alert=True)
+
+    @router.callback_query(F.data.startswith("transfer:"))
+    async def transfer_prompt(call: CallbackQuery):
+        game_id = int(call.data.split(":")[1])
+        try:
+            people = service.members(game_id, call.from_user.id)
+            await call.answer()
+            await screen(call.message, "👑 Выберите нового ведущего:",
+                         kb(*[(p.nickname[:35], f"sethost:{game_id}:{p.user_id}")
+                              for p in people if p.user_id != call.from_user.id],
+                            ("⬅️ К настройкам", f"settings:{game_id}")))
+        except ValueError as exc:
+            await call.answer(str(exc), show_alert=True)
+
+    @router.callback_query(F.data.startswith("sethost:"))
+    async def set_host(call: CallbackQuery):
+        _, game_text, user_text = call.data.split(":")
+        try:
+            service.transfer_host(int(game_text), call.from_user.id, int(user_text))
+            await call.answer("Роль передана")
+            await show_game(call.message, int(game_text), call.from_user.id)
+        except ValueError as exc:
+            await call.answer(str(exc), show_alert=True)
 
     return router
