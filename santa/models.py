@@ -37,6 +37,12 @@ class User(Base):
     blocked: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
+class ReminderPreference(Base):
+    __tablename__ = "reminder_preferences"
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"), primary_key=True)
+    daily_gift: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
 class Game(Base):
     __tablename__ = "games"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -46,7 +52,7 @@ class Game(Base):
     description: Mapped[str] = mapped_column(Text, default="")
     mode: Mapped[str] = mapped_column(String(12))
     budget: Mapped[str] = mapped_column(String(80), default="По договорённости")
-    timezone: Mapped[str] = mapped_column(String(64), default="Asia/Yekaterinburg")
+    timezone: Mapped[str] = mapped_column(String(64), default="server")
     registration_deadline: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     gift_deadline: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     celebration_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

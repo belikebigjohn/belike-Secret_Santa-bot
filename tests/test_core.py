@@ -1,4 +1,4 @@
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import select
@@ -139,3 +139,33 @@ def test_opt_out_cancels_pending_reminder(service):
     service.set_reminders(1, False)
     with service.sessions() as db:
         assert db.scalar(select(Delivery)).state == "cancelled"
+
+
+def test_daily_gift_reminder_once_per_day_until_ready(service):
+    now = datetime.now().replace(hour=12, minute=0, second=0, microsecond=0).astimezone(UTC).replace(tzinfo=None)
+    game = service.create_game(1, "Host", "Holiday", Mode.BLIND,
+                               gift_deadline=now + timedelta(days=5))
+    service.join(game.id, 2, "Two")
+    service.join(game.id, 3, "Three")
+    service.run_draw(game.id, 1)
+    service.set_daily_reminders(2, True)
+    assert service.daily_reminders_enabled(2)
+    assert service.schedule_reminders(now) == 1
+    assert service.schedule_reminders(now) == 0
+    service.set_gift_status(game.id, 2, "ready")
+    assert service.schedule_reminders(now + timedelta(days=1)) == 0
+
+
+def test_daily_toggle_cancels_waiting_job(service):
+    now = datetime.now().replace(hour=12, minute=0, second=0, microsecond=0).astimezone(UTC).replace(tzinfo=None)
+    game = service.create_game(1, "Host", "Holiday", Mode.HOST,
+                               gift_deadline=now + timedelta(days=5))
+    service.join(game.id, 2, "Two")
+    service.join(game.id, 3, "Three")
+    service.run_draw(game.id, 1)
+    service.set_daily_reminders(2, True)
+    service.schedule_reminders(now)
+    service.set_daily_reminders(2, False)
+    with service.sessions() as db:
+        job = db.scalar(select(Delivery).where(Delivery.key.like("daily:%")))
+        assert job.state == "cancelled"

@@ -1,11 +1,22 @@
 import secrets
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from santa.draw import draw
-from santa.models import Assignment, Base, Delivery, Exclusion, Game, Member, Mode, User, utcnow
+from santa.models import (
+    Assignment,
+    Base,
+    Delivery,
+    Exclusion,
+    Game,
+    Member,
+    Mode,
+    ReminderPreference,
+    User,
+    utcnow,
+)
 
 
 class AccessDenied(ValueError):
@@ -25,6 +36,10 @@ class Service:
     def create_schema(self) -> None:
         Base.metadata.create_all(self.engine)
 
+    def ensure_user(self, user_id: int, name: str) -> None:
+        with self.sessions.begin() as db:
+            self.user(db, user_id, name)
+
     @staticmethod
     def user(db: Session, user_id: int, name: str) -> User:
         user = db.get(User, user_id)
@@ -41,7 +56,7 @@ class Service:
                     registration_deadline: datetime | None = None,
                     gift_deadline: datetime | None = None,
                     celebration_at: datetime | None = None,
-                    timezone: str = "Asia/Yekaterinburg") -> Game:
+                    timezone: str = "server") -> Game:
         if not title.strip():
             raise ValueError("Укажите название игры")
         dates = [d for d in (registration_deadline, gift_deadline, celebration_at) if d]
@@ -144,7 +159,30 @@ class Service:
             if not enabled:
                 for job in db.scalars(select(Delivery).where(
                     Delivery.user_id == user_id, Delivery.state == "pending",
-                    Delivery.key.like("reminder:%"))):
+                    (Delivery.key.like("reminder:%")) | (Delivery.key.like("daily:%")))):
+                    job.state = "cancelled"
+
+    def daily_reminders_enabled(self, user_id: int) -> bool:
+        with self.sessions() as db:
+            preference = db.get(ReminderPreference, user_id)
+            return bool(preference and preference.daily_gift)
+
+    def set_daily_reminders(self, user_id: int, enabled: bool) -> None:
+        with self.sessions.begin() as db:
+            user = db.get(User, user_id)
+            if user is None:
+                raise AccessDenied("Сначала откройте /start")
+            preference = db.get(ReminderPreference, user_id)
+            if preference is None:
+                preference = ReminderPreference(user_id=user_id)
+                db.add(preference)
+            preference.daily_gift = enabled
+            if enabled:
+                user.reminders_opt_in = True
+            else:
+                for job in db.scalars(select(Delivery).where(
+                    Delivery.user_id == user_id, Delivery.state == "pending",
+                    Delivery.key.like("daily:%"))):
                     job.state = "cancelled"
 
     def add_exclusion(self, game_id: int, host_id: int, giver_id: int, receiver_id: int) -> None:
@@ -234,6 +272,7 @@ class Service:
 
     def schedule_reminders(self, now: datetime | None = None) -> int:
         now = now or utcnow()
+        local_now = now.replace(tzinfo=UTC).astimezone()
         count = 0
         with self.sessions.begin() as db:
             games = db.scalars(select(Game).where(Game.reminders_enabled.is_(True),
@@ -253,6 +292,22 @@ class Service:
                         if user.reminders_opt_in and not db.scalar(select(Delivery.id).where(Delivery.key == key)):
                             db.add(Delivery(key=key, user_id=user_id, text=f"{message} в игре «{game.title}»."))
                             count += 1
+                if game.status != "drawn" or not game.gift_deadline or game.gift_deadline <= now:
+                    continue
+                if local_now.hour < 9:
+                    continue
+                for member in db.scalars(select(Member).where(Member.game_id == game.id)):
+                    if member.gift_status in {"ready", "sent", "given"}:
+                        continue
+                    user = db.get(User, member.user_id)
+                    preference = db.get(ReminderPreference, member.user_id)
+                    if not user.reminders_opt_in or not preference or not preference.daily_gift:
+                        continue
+                    key = f"daily:{game.id}:{local_now:%Y-%m-%d}:{member.user_id}"
+                    if not db.scalar(select(Delivery.id).where(Delivery.key == key)):
+                        db.add(Delivery(key=key, user_id=member.user_id,
+                                        text=f"🎁 Напоминание: подготовьте подарок для игры «{game.title}»."))
+                        count += 1
         return count
 
     def is_owner(self, user_id: int) -> bool:
