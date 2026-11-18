@@ -1,0 +1,250 @@
+import secrets
+from datetime import datetime, timedelta
+
+from sqlalchemy import create_engine, func, select
+from sqlalchemy.orm import Session, sessionmaker
+
+from santa.draw import draw
+from santa.models import Assignment, Base, Delivery, Exclusion, Game, Member, Mode, User, utcnow
+
+
+class AccessDenied(ValueError):
+    pass
+
+
+class InvalidState(ValueError):
+    pass
+
+
+class Service:
+    def __init__(self, url: str, owner_ids: frozenset[int] = frozenset()):
+        self.engine = create_engine(url, pool_pre_ping=True)
+        self.sessions = sessionmaker(self.engine, expire_on_commit=False)
+        self.owner_ids = owner_ids
+
+    def create_schema(self) -> None:
+        Base.metadata.create_all(self.engine)
+
+    @staticmethod
+    def user(db: Session, user_id: int, name: str) -> User:
+        user = db.get(User, user_id)
+        if user is None:
+            user = User(id=user_id, name=name[:120])
+            db.add(user)
+            db.flush()
+        elif name and user.name != name[:120]:
+            user.name = name[:120]
+        return user
+
+    def create_game(self, host_id: int, host_name: str, title: str, mode: Mode,
+                    budget: str = "По договорённости", description: str = "",
+                    registration_deadline: datetime | None = None,
+                    gift_deadline: datetime | None = None,
+                    celebration_at: datetime | None = None,
+                    timezone: str = "Asia/Yekaterinburg") -> Game:
+        if not title.strip():
+            raise ValueError("Укажите название игры")
+        dates = [d for d in (registration_deadline, gift_deadline, celebration_at) if d]
+        if dates != sorted(dates):
+            raise ValueError("Даты должны идти по порядку")
+        with self.sessions.begin() as db:
+            self.user(db, host_id, host_name)
+            game = Game(host_id=host_id, title=title.strip()[:120], description=description[:2000],
+                        mode=mode.value, budget=budget[:80], token=secrets.token_urlsafe(24),
+                        registration_deadline=registration_deadline, gift_deadline=gift_deadline,
+                        celebration_at=celebration_at, timezone=timezone)
+            db.add(game)
+            db.flush()
+            if mode != Mode.HOST:
+                db.add(Member(game_id=game.id, user_id=host_id, nickname=host_name[:120]))
+            return game
+
+    def game_by_token(self, token: str) -> Game | None:
+        with self.sessions() as db:
+            return db.scalar(select(Game).where(Game.token == token))
+
+    def game(self, game_id: int) -> Game | None:
+        with self.sessions() as db:
+            return db.get(Game, game_id)
+
+    def my_games(self, user_id: int) -> list[Game]:
+        with self.sessions() as db:
+            return list(db.scalars(select(Game).outerjoin(Member, Member.game_id == Game.id)
+                                   .where((Game.host_id == user_id) | (Member.user_id == user_id))
+                                   .distinct().order_by(Game.id.desc())))
+
+    def members(self, game_id: int, viewer_id: int) -> list[Member]:
+        with self.sessions() as db:
+            game = self._game(db, game_id)
+            self._require_host(game, viewer_id)
+            return list(db.scalars(select(Member).where(Member.game_id == game_id).order_by(Member.id)))
+
+    def join(self, game_id: int, user_id: int, name: str) -> Member:
+        with self.sessions.begin() as db:
+            game = self._game(db, game_id, lock=True)
+            if game.status != "registration" or (game.registration_deadline and game.registration_deadline < utcnow()):
+                raise InvalidState("Регистрация в эту игру закрыта")
+            if game.host_id == user_id and game.mode == Mode.HOST.value:
+                raise InvalidState("В этом режиме ведущий не участвует")
+            self.user(db, user_id, name)
+            member = db.scalar(select(Member).where(Member.game_id == game_id, Member.user_id == user_id))
+            if member is None:
+                member = Member(game_id=game_id, user_id=user_id, nickname=name[:120])
+                db.add(member)
+                db.flush()
+            return member
+
+    def member(self, game_id: int, user_id: int) -> Member | None:
+        with self.sessions() as db:
+            return db.scalar(select(Member).where(Member.game_id == game_id, Member.user_id == user_id))
+
+    def profile(self, game_id: int, user_id: int, **fields: str) -> None:
+        allowed = {"nickname", "wishes", "interests", "avoid", "wishlist_url"}
+        if not fields.keys() <= allowed:
+            raise ValueError("Недопустимое поле анкеты")
+        with self.sessions.begin() as db:
+            member = db.scalar(select(Member).where(Member.game_id == game_id, Member.user_id == user_id))
+            if member is None:
+                raise AccessDenied("Вы не участвуете в этой игре")
+            for key, value in fields.items():
+                if len(value) > (500 if key == "wishlist_url" else 2000):
+                    raise ValueError("Текст слишком длинный")
+                setattr(member, key, value.strip())
+
+    def set_mode(self, game_id: int, host_id: int, mode: Mode) -> None:
+        with self.sessions.begin() as db:
+            game = self._game(db, game_id, lock=True)
+            self._require_host(game, host_id)
+            if game.status != "registration":
+                raise InvalidState("После жеребьёвки режим менять нельзя")
+            existing = db.scalar(select(Member).where(Member.game_id == game_id, Member.user_id == host_id))
+            if mode == Mode.HOST and existing:
+                db.delete(existing)
+            elif mode != Mode.HOST and existing is None:
+                host = db.get(User, host_id)
+                db.add(Member(game_id=game_id, user_id=host_id, nickname=host.name))
+            game.mode = mode.value
+
+    def add_exclusion(self, game_id: int, host_id: int, giver_id: int, receiver_id: int) -> None:
+        with self.sessions.begin() as db:
+            game = self._game(db, game_id, lock=True)
+            self._require_host(game, host_id)
+            if game.status != "registration":
+                raise InvalidState("После жеребьёвки ограничения менять нельзя")
+            ids = set(db.scalars(select(Member.user_id).where(Member.game_id == game_id)))
+            if giver_id not in ids or receiver_id not in ids:
+                raise ValueError("Оба участника должны быть в игре")
+            if not db.scalar(select(Exclusion).where(Exclusion.game_id == game_id,
+                                                     Exclusion.giver_id == giver_id,
+                                                     Exclusion.receiver_id == receiver_id)):
+                db.add(Exclusion(game_id=game_id, giver_id=giver_id, receiver_id=receiver_id))
+
+    def run_draw(self, game_id: int, host_id: int) -> dict[int, int]:
+        with self.sessions.begin() as db:
+            game = self._game(db, game_id, lock=True)
+            self._require_host(game, host_id)
+            if game.status != "registration":
+                raise InvalidState("Жеребьёвка уже проведена или регистрация закрыта")
+            members = list(db.scalars(select(Member).where(Member.game_id == game_id)))
+            exclusions = set(db.execute(select(Exclusion.giver_id, Exclusion.receiver_id)
+                                        .where(Exclusion.game_id == game_id)).all())
+            result = draw([m.user_id for m in members], exclusions)
+            by_id = {m.user_id: m for m in members}
+            for giver, receiver in result.items():
+                db.add(Assignment(game_id=game_id, giver_id=giver, receiver_id=receiver))
+                target = by_id[receiver]
+                db.add(Delivery(key=f"draw:{game_id}:{giver}", user_id=giver,
+                                text=f"🎁 Твоя миссия в игре «{game.title}»: подарок для {target.nickname}.\n"
+                                     f"Пожелания: {target.wishes or 'пока не заполнены'}\n"
+                                     f"Не дарить: {target.avoid or 'не указано'}\nБюджет: {game.budget}"))
+            game.status = "drawn"
+            return result
+
+    def assignment(self, game_id: int, user_id: int) -> tuple[Member, Game] | None:
+        with self.sessions() as db:
+            assignment = db.scalar(select(Assignment).where(Assignment.game_id == game_id,
+                                                             Assignment.giver_id == user_id))
+            if assignment is None:
+                return None
+            receiver = db.scalar(select(Member).where(Member.game_id == game_id,
+                                                       Member.user_id == assignment.receiver_id))
+            return receiver, self._game(db, game_id)
+
+    def all_assignments(self, game_id: int, viewer_id: int) -> list[tuple[str, str]]:
+        with self.sessions() as db:
+            game = self._game(db, game_id)
+            self._require_host(game, viewer_id)
+            if game.mode == Mode.BLIND.value:
+                raise AccessDenied("В режиме «Играю вслепую» общая таблица скрыта")
+            names = {m.user_id: m.nickname for m in db.scalars(select(Member).where(Member.game_id == game_id))}
+            return [(names[a.giver_id], names[a.receiver_id]) for a in
+                    db.scalars(select(Assignment).where(Assignment.game_id == game_id))]
+
+    def set_gift_status(self, game_id: int, user_id: int, status: str) -> None:
+        if status not in {"choosing", "bought", "ready", "sent", "given"}:
+            raise ValueError("Неизвестный статус")
+        with self.sessions.begin() as db:
+            member = db.scalar(select(Member).where(Member.game_id == game_id, Member.user_id == user_id))
+            if member is None or self._game(db, game_id).status != "drawn":
+                raise AccessDenied("Нет активного назначения")
+            member.gift_status = status
+
+    def progress(self, game_id: int, host_id: int) -> tuple[int, int]:
+        with self.sessions() as db:
+            self._require_host(self._game(db, game_id), host_id)
+            total = db.scalar(select(func.count()).select_from(Member).where(Member.game_id == game_id))
+            ready = db.scalar(select(func.count()).select_from(Member).where(
+                Member.game_id == game_id, Member.gift_status.in_(["ready", "sent", "given"])))
+            return total or 0, ready or 0
+
+    def announce(self, game_id: int, host_id: int, text: str) -> int:
+        if not text.strip() or len(text) > 3000:
+            raise ValueError("Сообщение должно быть от 1 до 3000 символов")
+        with self.sessions.begin() as db:
+            game = self._game(db, game_id)
+            self._require_host(game, host_id)
+            members = list(db.scalars(select(Member).where(Member.game_id == game_id)))
+            batch = secrets.token_hex(8)
+            for member in members:
+                db.add(Delivery(key=f"announcement:{game_id}:{batch}:{member.user_id}",
+                                user_id=member.user_id, text=f"📣 {game.title}\n{text.strip()}"))
+            return len(members)
+
+    def schedule_reminders(self, now: datetime | None = None) -> int:
+        now = now or utcnow()
+        count = 0
+        with self.sessions.begin() as db:
+            games = db.scalars(select(Game).where(Game.reminders_enabled.is_(True),
+                                                   Game.status.in_(["registration", "drawn"]))).all()
+            for game in games:
+                events = [("registration", game.registration_deadline, "⏰ Регистрация скоро закроется"),
+                          ("gift", game.gift_deadline, "🎁 Скоро срок подготовки подарка"),
+                          ("celebration", game.celebration_at, "🎄 Скоро вручение подарков")]
+                for kind, deadline, message in events:
+                    if not deadline or not deadline - timedelta(days=1) <= now < deadline:
+                        continue
+                    if kind == "registration" and game.status != "registration":
+                        continue
+                    for user_id in db.scalars(select(Member.user_id).where(Member.game_id == game.id)):
+                        user = db.get(User, user_id)
+                        key = f"reminder:{game.id}:{kind}:{user_id}"
+                        if user.reminders_opt_in and not db.scalar(select(Delivery.id).where(Delivery.key == key)):
+                            db.add(Delivery(key=key, user_id=user_id, text=f"{message} в игре «{game.title}»."))
+                            count += 1
+        return count
+
+    def is_owner(self, user_id: int) -> bool:
+        return user_id in self.owner_ids
+
+    @staticmethod
+    def _game(db: Session, game_id: int, lock: bool = False) -> Game:
+        statement = select(Game).where(Game.id == game_id)
+        game = db.scalar(statement.with_for_update() if lock else statement)
+        if game is None:
+            raise ValueError("Игра не найдена")
+        return game
+
+    @staticmethod
+    def _require_host(game: Game, user_id: int) -> None:
+        if game.host_id != user_id:
+            raise AccessDenied("Только ведущий этой игры может выполнить действие")
