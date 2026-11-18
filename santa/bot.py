@@ -12,6 +12,7 @@ from aiogram.types import (
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InputMediaPhoto,
     Message,
 )
 
@@ -31,6 +32,8 @@ class Form(StatesGroup):
 
 
 POSTER = Path(__file__).resolve().parent.parent / "assets" / "host_modes.png"
+WELCOME_ART = POSTER.with_name("welcome.png")
+MISSION_ART = POSTER.with_name("mission.png")
 MODE_NAMES = {"blind": "🎁 Играю вслепую", "open": "🎩 Играю и всё знаю",
               "host": "👑 Только организатор"}
 
@@ -59,17 +62,39 @@ def create_router(service: Service, bot_username: str) -> Router:
         except TelegramBadRequest:
             pass
 
-    async def screen(message: Message, text: str, keyboard: InlineKeyboardMarkup | None = None) -> Message:
+    async def screen(message: Message, text: str, keyboard: InlineKeyboardMarkup | None = None,
+                     art: Path | None = None) -> Message:
+        # Telegram captions are limited to 1024 characters; long profiles stay text-only.
+        if len(text) > 1000 or (art is not None and not art.is_file()):
+            art = None
         if message.from_user and message.from_user.is_bot:
             try:
-                if message.photo:
+                if art is not None:
+                    if message.photo:
+                        return await message.edit_media(
+                            media=InputMediaPhoto(media=FSInputFile(art), caption=text,
+                                                  parse_mode="HTML"),
+                            reply_markup=keyboard)
+                    replacement = await message.answer_photo(FSInputFile(art), caption=text,
+                                                             reply_markup=keyboard, parse_mode="HTML")
+                    await safe_delete(message)
+                    return replacement
+                if message.photo and len(text) <= 1000:
                     return await message.edit_caption(caption=text, reply_markup=keyboard,
                                                       parse_mode="HTML")
+                if message.photo:
+                    replacement = await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
+                    await safe_delete(message)
+                    return replacement
                 return await message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
             except TelegramBadRequest as exc:
                 if "message is not modified" in str(exc).lower():
                     return message
-        replacement = await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
+        if art is not None:
+            replacement = await message.answer_photo(FSInputFile(art), caption=text,
+                                                     reply_markup=keyboard, parse_mode="HTML")
+        else:
+            replacement = await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
         if message.from_user and message.from_user.is_bot:
             await safe_delete(message)
         return replacement
@@ -134,7 +159,7 @@ def create_router(service: Service, bot_username: str) -> Router:
             if game.mode != Mode.BLIND.value:
                 buttons.append(("🔐 Распределение", f"pairs:{game_id}"))
         buttons.append(("⬅️ Мои игры", "games"))
-        return await screen(message, "\n".join(lines), kb(*buttons))
+        return await screen(message, "\n".join(lines), kb(*buttons), art=WELCOME_ART)
 
     @router.message(CommandStart())
     async def start(message: Message, state: FSMContext):
@@ -147,11 +172,11 @@ def create_router(service: Service, bot_username: str) -> Router:
                 await screen(message, f"🎄 <b>{escape(game.title)}</b>\n{escape(game.description)}\n"
                              f"Бюджет: {escape(game.budget)}",
                              kb(("Участвовать", f"join:{game.id}"),
-                                ("⬅️ Главное меню", "home")))
+                                ("⬅️ Главное меню", "home")), art=WELCOME_ART)
                 return
         await screen(message, "🎅 <b>Тайный Санта</b>\n\nСоздайте игру или откройте свои игры.",
                      kb(("🎄 Создать игру", "create"), ("🎁 Мои игры", "games"),
-                        ("⚙️ Мои напоминания", "personal")))
+                        ("⚙️ Мои напоминания", "personal")), art=WELCOME_ART)
 
     @router.callback_query(F.data == "home")
     async def home(call: CallbackQuery, state: FSMContext):
@@ -159,7 +184,7 @@ def create_router(service: Service, bot_username: str) -> Router:
         await state.clear()
         await screen(call.message, "🎅 <b>Тайный Санта</b>\n\nСоздайте игру или откройте свои игры.",
                      kb(("🎄 Создать игру", "create"), ("🎁 Мои игры", "games"),
-                        ("⚙️ Мои напоминания", "personal")))
+                        ("⚙️ Мои напоминания", "personal")), art=WELCOME_ART)
 
     @router.callback_query(F.data == "games")
     async def games(call: CallbackQuery, state: FSMContext):
@@ -186,12 +211,7 @@ def create_router(service: Service, bot_username: str) -> Router:
             ("🎩 Играю и всё знаю", "mode:open"),
             ("👑 Только организатор", "mode:host"),
             ("⬅️ Главное меню", "home"))
-        if call.message.photo or not POSTER.is_file():
-            await screen(call.message, caption, keyboard)
-        else:
-            await call.message.answer_photo(FSInputFile(POSTER), caption=caption,
-                                            reply_markup=keyboard, parse_mode="HTML")
-            await safe_delete(call.message)
+        await screen(call.message, caption, keyboard, art=POSTER)
 
     @router.callback_query(F.data.startswith("mode:"))
     async def mode(call: CallbackQuery, state: FSMContext):
@@ -380,7 +400,7 @@ def create_router(service: Service, bot_username: str) -> Router:
                      f"<b>Не дарить:</b> {escape(receiver.avoid or 'не указано')}\n\n"
                      f"<b>Бюджет:</b> {escape(game_.budget)}",
                      kb(("✅ Подарок готов", f"ready:{game_id}"),
-                        ("⬅️ К игре", f"game:{game_id}")))
+                        ("⬅️ К игре", f"game:{game_id}")), art=MISSION_ART)
 
     @router.callback_query(F.data.startswith("ready:"))
     async def ready(call: CallbackQuery):
@@ -493,7 +513,7 @@ def create_router(service: Service, bot_username: str) -> Router:
             await call.answer("Жеребьёвка проведена")
             await screen(call.message,
                          "🎲 <b>Жеребьёвка завершена</b>\n\nЛичные назначения поставлены в очередь доставки.",
-                         kb(("⬅️ К игре", f"game:{game_id}")))
+                         kb(("⬅️ К игре", f"game:{game_id}")), art=MISSION_ART)
         except ValueError as exc:
             await call.answer(str(exc), show_alert=True)
 
