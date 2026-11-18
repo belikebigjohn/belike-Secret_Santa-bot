@@ -1,6 +1,7 @@
 from datetime import UTC, datetime
 from html import escape
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
@@ -16,6 +17,7 @@ from aiogram.types import (
     Message,
 )
 
+from santa.formatting import profile_link
 from santa.models import Mode, utcnow
 from santa.service import AccessDenied, InvalidState, Service
 
@@ -41,25 +43,47 @@ WELCOME_ART = POSTER.with_name("welcome.png")
 MISSION_ART = POSTER.with_name("mission.png")
 MODE_NAMES = {"blind": "🎁 Играю вслепую", "open": "🎩 Играю и всё знаю",
               "host": "👑 Только организатор"}
+MOSCOW = ZoneInfo("Europe/Moscow")
 
 
 def local_date(value: str) -> datetime:
-    """Convert 18:00 in the server's local timezone to naive UTC."""
-    return datetime.strptime(value.strip(), "%d.%m.%Y").replace(hour=18).astimezone(UTC).replace(tzinfo=None)
+    """Convert 18:00 Moscow time to naive UTC for database storage."""
+    return datetime.strptime(value.strip(), "%d.%m.%Y").replace(
+        hour=18, tzinfo=MOSCOW).astimezone(UTC).replace(tzinfo=None)
 
 
 def display_date(value: datetime | None) -> str:
-    return value.replace(tzinfo=UTC).astimezone().strftime("%d.%m.%Y, %H:%M") if value else "не указана"
+    return value.replace(tzinfo=UTC).astimezone(MOSCOW).strftime("%d.%m.%Y, %H:%M") if value else "не указана"
 
 
 def kb(*items: tuple[str, str]) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=label, callback_data=data)] for label, data in items
-    ])
+    rows: list[list[InlineKeyboardButton]] = []
+    pending: InlineKeyboardButton | None = None
+    for label, data in items:
+        button = InlineKeyboardButton(text=label, callback_data=data)
+        full_row = label.startswith(("⬅️", "✅ Подтвердить", "🏁", "🗄")) or len(label) > 24
+        if full_row:
+            if pending:
+                rows.append([pending])
+                pending = None
+            rows.append([button])
+        elif pending:
+            if len(pending.text) + len(label) > 36:
+                rows.append([pending])
+                pending = button
+            else:
+                rows.append([pending, button])
+                pending = None
+        else:
+            pending = button
+    if pending:
+        rows.append([pending])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def create_router(service: Service, bot_username: str) -> Router:
     router = Router()
+    art_file_ids: dict[Path, str] = {}
 
     async def safe_delete(message: Message):
         try:
@@ -72,19 +96,24 @@ def create_router(service: Service, bot_username: str) -> Router:
         # Telegram captions are limited to 1024 characters; long profiles stay text-only.
         if len(text) > 1000 or (isinstance(art, Path) and not art.is_file()):
             art = None
-        media = FSInputFile(art) if isinstance(art, Path) else art
+        media = (art_file_ids.get(art) or FSInputFile(art)) if isinstance(art, Path) else art
+
+        def cache_art(sent: Message) -> Message:
+            if isinstance(art, Path) and sent.photo:
+                art_file_ids[art] = sent.photo[-1].file_id
+            return sent
         if message.from_user and message.from_user.is_bot:
             try:
                 if art is not None:
                     if message.photo:
-                        return await message.edit_media(
+                        return cache_art(await message.edit_media(
                             media=InputMediaPhoto(media=media, caption=text,
                                                   parse_mode="HTML"),
-                            reply_markup=keyboard)
+                            reply_markup=keyboard))
                     replacement = await message.answer_photo(media, caption=text,
                                                              reply_markup=keyboard, parse_mode="HTML")
                     await safe_delete(message)
-                    return replacement
+                    return cache_art(replacement)
                 if message.photo and len(text) <= 1000:
                     return await message.edit_caption(caption=text, reply_markup=keyboard,
                                                       parse_mode="HTML")
@@ -97,8 +126,8 @@ def create_router(service: Service, bot_username: str) -> Router:
                 if "message is not modified" in str(exc).lower():
                     return message
         if art is not None:
-            replacement = await message.answer_photo(media, caption=text,
-                                                     reply_markup=keyboard, parse_mode="HTML")
+            replacement = cache_art(await message.answer_photo(media, caption=text,
+                                                   reply_markup=keyboard, parse_mode="HTML"))
         else:
             replacement = await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
         if message.from_user and message.from_user.is_bot:
@@ -133,12 +162,11 @@ def create_router(service: Service, bot_username: str) -> Router:
         await safe_delete(message)
 
     async def show_game(message: Message, game_id: int, viewer_id: int):
-        game = service.game(game_id)
-        if game is None or game_id not in {g.id for g in service.my_games(viewer_id)}:
+        view = service.game_view(game_id, viewer_id)
+        if view is None:
             await screen(message, "Игра не найдена или доступ закрыт.")
             return
-        member = service.member(game_id, viewer_id)
-        total = len(service.members(game_id, viewer_id)) if game.host_id == viewer_id else None
+        game, member, total = view
         lines = [f"🎄 <b>{escape(game.title)}</b>",
                  f"<i>{MODE_NAMES[game.mode]}</i>"]
         if game.description:
@@ -150,7 +178,7 @@ def create_router(service: Service, bot_username: str) -> Router:
         if total is not None:
             lines.extend(["", f"👥 <b>Участников:</b> {total}",
                           f"🔗 <b>Приглашение:</b> <code>https://t.me/{bot_username}?start=join_{game.token}</code>"])
-        lines.extend(["", "📅 <b>Даты по времени сервера</b>"])
+        lines.extend(["", "📅 <b>Время московское</b>"])
         for label, value in (("Регистрация", game.registration_deadline),
                              ("Подарок", game.gift_deadline), ("Вручение", game.celebration_at)):
             lines.append(f"{label} — {display_date(value)}")
@@ -247,9 +275,9 @@ def create_router(service: Service, bot_username: str) -> Router:
             "title": (Form.title, "✏️ <b>Название игры</b>\n\nОтправьте название одним сообщением.", "create"),
             "budget": (Form.budget, "💰 <b>Бюджет подарка</b>\n\nНапример: до 2000 ₽", "wizard:title"),
             "registration": (Form.registration_date, ("📅 <b>Когда закончится регистрация?</b>\n\n"
-                             "Одна дата: <code>01.12.2026</code>\n<i>18:00 по времени сервера.</i>"), "wizard:budget"),
+                             "Одна дата: <code>01.12.2026</code>\n<i>18:00 по Москве.</i>"), "wizard:budget"),
             "gift": (Form.gift_date, ("🎁 <b>К какому дню подготовить подарок?</b>\n\n"
-                     "Одна дата: <code>20.12.2026</code>\n<i>18:00 по времени сервера.</i>"), "wizard:registration"),
+                     "Одна дата: <code>20.12.2026</code>\n<i>18:00 по Москве.</i>"), "wizard:registration"),
         }
         if step in prompts:
             form, text, back = prompts[step]
@@ -281,7 +309,7 @@ def create_router(service: Service, bot_username: str) -> Router:
         await state.update_data(budget=message.text.strip())
         await next_step(message, state, Form.registration_date,
                         "📅 <b>Когда закончится регистрация?</b>\n\n"
-                        "Отправьте одну дату: <code>01.12.2026</code>\n<i>18:00 по времени сервера.</i>",
+                        "Отправьте одну дату: <code>01.12.2026</code>\n<i>18:00 по Москве.</i>",
                         "wizard:budget")
 
     async def accept_date(message: Message, state: FSMContext, key: str,
@@ -317,7 +345,7 @@ def create_router(service: Service, bot_username: str) -> Router:
     async def registration_date(message: Message, state: FSMContext):
         await accept_date(message, state, "registration_deadline", None, Form.gift_date,
                           "🎁 <b>К какому дню подготовить подарок?</b>\n\n"
-                          "Отправьте одну дату: <code>20.12.2026</code>\n<i>18:00 по времени сервера.</i>",
+                          "Отправьте одну дату: <code>20.12.2026</code>\n<i>18:00 по Москве.</i>",
                           "wizard:budget", "wizard:registration")
 
     @router.message(Form.gift_date)
@@ -325,7 +353,7 @@ def create_router(service: Service, bot_username: str) -> Router:
         await accept_date(message, state, "gift_deadline", "registration_deadline",
                           Form.celebration_date,
                           "🎄 <b>Когда вручение подарков?</b>\n\n"
-                          "Отправьте одну дату: <code>25.12.2026</code>\n<i>18:00 по времени сервера.</i>",
+                          "Отправьте одну дату: <code>25.12.2026</code>\n<i>18:00 по Москве.</i>",
                           "wizard:registration", "wizard:gift")
 
     @router.message(Form.celebration_date)
@@ -412,7 +440,7 @@ def create_router(service: Service, bot_username: str) -> Router:
             return
         receiver, game_ = result
         await screen(call.message, f"🎁 <b>Твоя миссия</b>\n\n"
-                     f"<b>Получатель:</b> {escape(receiver.nickname)}\n\n"
+                     f"<b>Получатель:</b> {profile_link(receiver.user_id, receiver.nickname)}\n\n"
                      f"<b>Пожелания:</b> {escape(receiver.wishes or 'не указаны')}\n\n"
                      f"<b>Не дарить:</b> {escape(receiver.avoid or 'не указано')}\n\n"
                      f"<b>Бюджет:</b> {escape(game_.budget)}",
@@ -453,7 +481,7 @@ def create_router(service: Service, bot_username: str) -> Router:
             people = service.members(game_id, call.from_user.id)
             await call.answer()
             await screen(call.message, "👥 <b>Участники</b>\n\n" + "\n".join(
-                f"• {escape(p.nickname)}" for p in people),
+                f"• {profile_link(p.user_id, p.nickname)}" for p in people),
                 kb(("⬅️ К игре", f"game:{game_id}")))
         except AccessDenied as exc:
             await call.answer(str(exc), show_alert=True)
@@ -563,7 +591,8 @@ def create_router(service: Service, bot_username: str) -> Router:
             pairs_ = service.all_assignments(game_id, call.from_user.id)
             await call.answer()
             await screen(call.message, "🔐 <b>Распределение</b>\n\n" + "\n".join(
-                f"{escape(giver)} → {escape(receiver)}" for giver, receiver in pairs_),
+                f"{profile_link(giver.user_id, giver.nickname)} → "
+                f"{profile_link(receiver.user_id, receiver.nickname)}" for giver, receiver in pairs_),
                 kb(("⬅️ К игре", f"game:{game_id}")))
         except ValueError as exc:
             await call.answer(str(exc), show_alert=True)
@@ -618,7 +647,7 @@ def create_router(service: Service, bot_username: str) -> Router:
         await state.update_data(game_id=game_id)
         await state.set_state(Form.announcement_date)
         panel = await screen(call.message,
-                             "📅 Введите дату отправки в формате ДД.ММ.ГГГГ. Время — 18:00 по времени сервера.",
+                             "📅 Введите дату отправки в формате ДД.ММ.ГГГГ. Время — 18:00 по Москве.",
                              kb(("⬅️ К игре", f"game:{game_id}")))
         await remember(state, panel)
 
@@ -657,7 +686,7 @@ def create_router(service: Service, bot_username: str) -> Router:
         enabled = service.daily_reminders_enabled(call.from_user.id)
         await screen(call.message, "⚙️ <b>Мои напоминания</b>\n\n"
                      f"Ежедневное напоминание о подарке: <b>{'включено' if enabled else 'выключено'}</b>.\n\n"
-                     "<i>Приходит после 09:00 по времени сервера, пока подарок не готов.</i>\n\n"
+                     "<i>Приходит после 09:00 по Москве, пока подарок не готов.</i>\n\n"
                      f"Новости бота: <b>{'включены' if service.marketing_enabled(call.from_user.id) else 'выключены'}</b>.",
                      kb(("🔕 Выключить" if enabled else "🔔 Включить", "daily:toggle"),
                         ("📬 Настроить новости", "marketing:toggle"),
@@ -674,7 +703,7 @@ def create_router(service: Service, bot_username: str) -> Router:
         await call.answer("Сохранено")
         await screen(call.message, "⚙️ <b>Мои напоминания</b>\n\n"
                      f"Ежедневное напоминание о подарке: <b>{'включено' if enabled else 'выключено'}</b>.\n\n"
-                     "<i>Приходит после 09:00 по времени сервера, пока подарок не готов.</i>",
+                     "<i>Приходит после 09:00 по Москве, пока подарок не готов.</i>",
                      kb(("🔕 Выключить" if enabled else "🔔 Включить", "daily:toggle"),
                         ("📬 Настроить новости", "marketing:toggle"),
                         ("⬅️ Главное меню", "home")))
@@ -763,15 +792,20 @@ def create_router(service: Service, bot_username: str) -> Router:
         try:
             people = service.members(game_id, call.from_user.id)
             existing = service.exclusions(game_id, call.from_user.id)
-            names = {p.user_id: p.nickname for p in people}
-            lines = [f"• {escape(names.get(e.giver_id, '?'))} → {escape(names.get(e.receiver_id, '?'))}"
-                     for e in existing]
-            buttons = [(f"➕ От {p.nickname[:25]}", f"exgiver:{game_id}:{p.user_id}") for p in people[:30]]
-            buttons += [(f"✖ {names.get(e.giver_id, '?')[:12]} → {names.get(e.receiver_id, '?')[:12]}",
-                         f"exremove:{game_id}:{e.giver_id}:{e.receiver_id}") for e in existing[:30]]
+            names = {p.user_id: p for p in people}
+            lines = [f"{index}. {profile_link(p.user_id, p.nickname)}" for index, p in enumerate(people[:30], 1)]
+            excluded = [f"{index}. {profile_link(names[e.giver_id].user_id, names[e.giver_id].nickname)}"
+                        f" → {profile_link(names[e.receiver_id].user_id, names[e.receiver_id].nickname)}"
+                        for index, e in enumerate(existing[:30], 1)
+                        if e.giver_id in names and e.receiver_id in names]
+            buttons = [(f"➕ №{index}", f"exgiver:{game_id}:{p.user_id}")
+                       for index, p in enumerate(people[:30], 1)]
+            buttons += [(f"✖ №{index}", f"exremove:{game_id}:{e.giver_id}:{e.receiver_id}")
+                        for index, e in enumerate(existing[:30], 1)]
             await call.answer()
-            await screen(call.message, "🚫 <b>Запреты направленных пар</b>\n\n" +
-                         ("\n".join(lines) or "Пока нет запретов."),
+            await screen(call.message, "🚫 <b>Запреты направленных пар</b>\n\n"
+                         "<b>Выберите дарителя:</b>\n" + ("\n".join(lines) or "Участников нет.")
+                         + "\n\n<b>Текущие запреты:</b>\n" + ("\n".join(excluded) or "Нет."),
                          kb(*buttons, ("⬅️ К настройкам", f"settings:{game_id}")))
         except ValueError as exc:
             await call.answer(str(exc), show_alert=True)
@@ -785,9 +819,12 @@ def create_router(service: Service, bot_username: str) -> Router:
             if giver_id not in {p.user_id for p in people}:
                 raise ValueError("Участник не найден")
             await call.answer()
-            await screen(call.message, "Кому нельзя дарить подарок?",
-                         kb(*[(p.nickname[:35], f"exadd:{game_id}:{giver_id}:{p.user_id}")
-                              for p in people if p.user_id != giver_id],
+            candidates = [p for p in people if p.user_id != giver_id]
+            await screen(call.message, "Кому нельзя дарить подарок?\n\n" +
+                         "\n".join(f"{i}. {profile_link(p.user_id, p.nickname)}"
+                                   for i, p in enumerate(candidates[:30], 1)),
+                         kb(*[(f"Выбрать №{i}", f"exadd:{game_id}:{giver_id}:{p.user_id}")
+                              for i, p in enumerate(candidates[:30], 1)],
                             ("⬅️ К запретам", f"exclusions:{game_id}")))
         except ValueError as exc:
             await call.answer(str(exc), show_alert=True)
@@ -897,9 +934,12 @@ def create_router(service: Service, bot_username: str) -> Router:
         try:
             people = service.members(game_id, call.from_user.id)
             await call.answer()
-            await screen(call.message, "👑 Выберите нового ведущего:",
-                         kb(*[(p.nickname[:35], f"sethost:{game_id}:{p.user_id}")
-                              for p in people if p.user_id != call.from_user.id],
+            candidates = [p for p in people if p.user_id != call.from_user.id]
+            await screen(call.message, "👑 Выберите нового ведущего:\n\n" +
+                         "\n".join(f"{i}. {profile_link(p.user_id, p.nickname)}"
+                                   for i, p in enumerate(candidates[:30], 1)),
+                         kb(*[(f"Выбрать №{i}", f"sethost:{game_id}:{p.user_id}")
+                              for i, p in enumerate(candidates[:30], 1)],
                             ("⬅️ К настройкам", f"settings:{game_id}")))
         except ValueError as exc:
             await call.answer(str(exc), show_alert=True)

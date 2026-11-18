@@ -22,9 +22,9 @@ async def deliver_once(service: Service, bot: Bot) -> int:
             return 0
         job.state = "sending"
         job.attempts += 1
-        job_id, user_id, content = job.id, job.user_id, job.text
+        job_id, user_id, content, parse_mode = job.id, job.user_id, job.text, job.parse_mode
     try:
-        await bot.send_message(user_id, content)
+        await bot.send_message(user_id, content, parse_mode=parse_mode or None)
     except TelegramForbiddenError:
         with service.sessions.begin() as db:
             db.get(User, user_id).blocked = True

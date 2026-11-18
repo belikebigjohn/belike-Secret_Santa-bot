@@ -1,10 +1,13 @@
 import secrets
 from datetime import UTC, datetime, timedelta
+from html import escape
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import create_engine, func, inspect, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from santa.draw import draw
+from santa.formatting import profile_link
 from santa.models import (
     Assignment,
     Base,
@@ -45,6 +48,9 @@ class Service:
             columns = {column["name"] for column in inspect(connection).get_columns("members")}
             if "received" not in columns:
                 connection.execute(text("ALTER TABLE members ADD COLUMN received BOOLEAN DEFAULT FALSE NOT NULL"))
+            columns = {column["name"] for column in inspect(connection).get_columns("deliveries")}
+            if "parse_mode" not in columns:
+                connection.execute(text("ALTER TABLE deliveries ADD COLUMN parse_mode VARCHAR(16) DEFAULT '' NOT NULL"))
 
     def ensure_user(self, user_id: int, name: str) -> None:
         with self.sessions.begin() as db:
@@ -66,7 +72,7 @@ class Service:
                     registration_deadline: datetime | None = None,
                     gift_deadline: datetime | None = None,
                     celebration_at: datetime | None = None,
-                    timezone: str = "server") -> Game:
+                    timezone: str = "Europe/Moscow") -> Game:
         if not title.strip():
             raise ValueError("Укажите название игры")
         dates = [d for d in (registration_deadline, gift_deadline, celebration_at) if d]
@@ -91,6 +97,20 @@ class Service:
     def game(self, game_id: int) -> Game | None:
         with self.sessions() as db:
             return db.get(Game, game_id)
+
+    def game_view(self, game_id: int, viewer_id: int) -> tuple[Game, Member | None, int | None] | None:
+        """Fetch a game card with its access check in one database session."""
+        with self.sessions() as db:
+            game = db.get(Game, game_id)
+            if game is None:
+                return None
+            member = db.scalar(select(Member).where(Member.game_id == game_id,
+                                                    Member.user_id == viewer_id))
+            if game.host_id != viewer_id and member is None:
+                return None
+            total = (db.scalar(select(func.count()).select_from(Member).where(
+                Member.game_id == game_id)) or 0) if game.host_id == viewer_id else None
+            return game, member, total
 
     def my_games(self, user_id: int) -> list[Game]:
         with self.sessions() as db:
@@ -347,9 +367,11 @@ class Service:
                 db.add(Assignment(game_id=game_id, giver_id=giver, receiver_id=receiver))
                 target = by_id[receiver]
                 db.add(Delivery(key=f"draw:{game_id}:{giver}", user_id=giver,
-                                text=f"🎁 Твоя миссия в игре «{game.title}»: подарок для {target.nickname}.\n"
-                                     f"Пожелания: {target.wishes or 'пока не заполнены'}\n"
-                                     f"Не дарить: {target.avoid or 'не указано'}\nБюджет: {game.budget}"))
+                                text=f"🎁 Твоя миссия в игре «{escape(game.title)}»: подарок для "
+                                     f"{profile_link(target.user_id, target.nickname)}.\n"
+                                     f"Пожелания: {escape(target.wishes or 'пока не заполнены')}\n"
+                                     f"Не дарить: {escape(target.avoid or 'не указано')}\n"
+                                     f"Бюджет: {escape(game.budget)}", parse_mode="HTML"))
             game.status = "drawn"
             return result
 
@@ -363,14 +385,14 @@ class Service:
                                                        Member.user_id == assignment.receiver_id))
             return receiver, self._game(db, game_id)
 
-    def all_assignments(self, game_id: int, viewer_id: int) -> list[tuple[str, str]]:
+    def all_assignments(self, game_id: int, viewer_id: int) -> list[tuple[Member, Member]]:
         with self.sessions() as db:
             game = self._game(db, game_id)
             self._require_host(game, viewer_id)
             if game.mode == Mode.BLIND.value:
                 raise AccessDenied("В режиме «Играю вслепую» общая таблица скрыта")
-            names = {m.user_id: m.nickname for m in db.scalars(select(Member).where(Member.game_id == game_id))}
-            return [(names[a.giver_id], names[a.receiver_id]) for a in
+            members = {m.user_id: m for m in db.scalars(select(Member).where(Member.game_id == game_id))}
+            return [(members[a.giver_id], members[a.receiver_id]) for a in
                     db.scalars(select(Assignment).where(Assignment.game_id == game_id))]
 
     def set_gift_status(self, game_id: int, user_id: int, status: str) -> None:
@@ -409,7 +431,7 @@ class Service:
 
     def schedule_reminders(self, now: datetime | None = None) -> int:
         now = now or utcnow()
-        local_now = now.replace(tzinfo=UTC).astimezone()
+        local_now = now.replace(tzinfo=UTC).astimezone(ZoneInfo("Europe/Moscow"))
         count = 0
         with self.sessions.begin() as db:
             games = db.scalars(select(Game).where(Game.reminders_enabled.is_(True),

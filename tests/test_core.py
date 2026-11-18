@@ -233,3 +233,23 @@ def test_scheduled_announcement_waits_for_due_time(service):
         assert all(job.due_at == due for job in jobs)
     with pytest.raises(ValueError):
         service.announce(game.id, 1, "Поздно", due_at=utcnow() - timedelta(seconds=1))
+
+
+def test_draw_notification_links_to_receiver(service):
+    game = game_with_players(service)
+    assignments = service.run_draw(game.id, 1)
+    giver, receiver = next(iter(assignments.items()))
+    with service.sessions() as db:
+        job = db.scalar(select(Delivery).where(Delivery.key == f"draw:{game.id}:{giver}"))
+        assert job.parse_mode == "HTML"
+        assert f'tg://user?id={receiver}' in job.text
+
+
+def test_game_view_preserves_access_and_host_count(service):
+    game = game_with_players(service)
+    host_view = service.game_view(game.id, 1)
+    assert host_view is not None and host_view[2] == 4
+    member_view = service.game_view(game.id, 2)
+    assert member_view is not None and member_view[1].user_id == 2
+    assert member_view[2] is None
+    assert service.game_view(game.id, 99) is None
