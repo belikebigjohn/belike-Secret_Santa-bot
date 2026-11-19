@@ -1,16 +1,18 @@
 import secrets
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import create_engine, delete, func, inspect, or_, select, text
+from alembic import command
+from alembic.config import Config
+from sqlalchemy import create_engine, delete, func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from santa.draw import draw
 from santa.formatting import limited_html, profile_link
 from santa.models import (
     Assignment,
-    Base,
     Broadcast,
     Delivery,
     Exclusion,
@@ -44,55 +46,11 @@ class Service:
         self.owner_ids = owner_ids
 
     def create_schema(self) -> None:
-        Base.metadata.create_all(self.engine)
-        # Upgrade databases created by earlier releases without dropping game data.
+        config = Config()
+        config.set_main_option("script_location", str(Path(__file__).parent / "migrations"))
         with self.engine.begin() as connection:
-            user_columns = {column["name"] for column in inspect(connection).get_columns("users")}
-            if "created_at" not in user_columns:
-                connection.execute(text("ALTER TABLE users ADD COLUMN created_at TIMESTAMP"))
-            columns = {column["name"] for column in inspect(connection).get_columns("games")}
-            for name, sql_type in (("rules", "TEXT"), ("cover_file_id", "VARCHAR(255)")):
-                if name not in columns:
-                    connection.execute(text(f"ALTER TABLE games ADD COLUMN {name} {sql_type} DEFAULT '' NOT NULL"))
-            for name in ("registration_start", "draw_at", "wishes_deadline", "shipping_deadline"):
-                if name not in columns:
-                    connection.execute(text(f"ALTER TABLE games ADD COLUMN {name} TIMESTAMP"))
-            if "max_members" not in columns:
-                connection.execute(text("ALTER TABLE games ADD COLUMN max_members INTEGER"))
-            if "approval_required" not in columns:
-                connection.execute(text("ALTER TABLE games ADD COLUMN approval_required BOOLEAN DEFAULT FALSE NOT NULL"))
-            if "team_policy" not in columns:
-                connection.execute(text("ALTER TABLE games ADD COLUMN team_policy VARCHAR(12) DEFAULT 'mixed' NOT NULL"))
-            if "advent_enabled" not in columns:
-                connection.execute(text("ALTER TABLE games ADD COLUMN advent_enabled BOOLEAN DEFAULT FALSE NOT NULL"))
-            columns = {column["name"] for column in inspect(connection).get_columns("members")}
-            if "received" not in columns:
-                connection.execute(text("ALTER TABLE members ADD COLUMN received BOOLEAN DEFAULT FALSE NOT NULL"))
-            if "team" not in columns:
-                connection.execute(text("ALTER TABLE members ADD COLUMN team VARCHAR(80) DEFAULT '' NOT NULL"))
-            if "approved" not in columns:
-                connection.execute(text("ALTER TABLE members ADD COLUMN approved BOOLEAN DEFAULT TRUE NOT NULL"))
-            columns = {column["name"] for column in inspect(connection).get_columns("deliveries")}
-            if "parse_mode" not in columns:
-                connection.execute(text("ALTER TABLE deliveries ADD COLUMN parse_mode VARCHAR(16) DEFAULT '' NOT NULL"))
-            if "claimed_at" not in columns:
-                connection.execute(text("ALTER TABLE deliveries ADD COLUMN claimed_at TIMESTAMP"))
-            for name, sql_type in (("media_type", "VARCHAR(12)"),
-                                   ("media_file_id", "VARCHAR(255)"),
-                                   ("button_text", "VARCHAR(64)"),
-                                   ("button_url", "VARCHAR(500)")):
-                if name not in columns:
-                    connection.execute(text(f"ALTER TABLE deliveries ADD COLUMN {name} {sql_type} DEFAULT '' NOT NULL"))
-            columns = {column["name"] for column in inspect(connection).get_columns("broadcasts")}
-            for name, sql_type in (("media_type", "VARCHAR(12)"),
-                                   ("media_file_id", "VARCHAR(255)"),
-                                   ("button_text", "VARCHAR(64)"),
-                                   ("button_url", "VARCHAR(500)")):
-                if name not in columns:
-                    connection.execute(text(f"ALTER TABLE broadcasts ADD COLUMN {name} {sql_type} DEFAULT '' NOT NULL"))
-            columns = {column["name"] for column in inspect(connection).get_columns("questions")}
-            if "reported" not in columns:
-                connection.execute(text("ALTER TABLE questions ADD COLUMN reported BOOLEAN DEFAULT FALSE NOT NULL"))
+            config.attributes["connection"] = connection
+            command.upgrade(config, "head")
 
     def ensure_user(self, user_id: int, name: str) -> None:
         with self.sessions.begin() as db:

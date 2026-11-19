@@ -353,6 +353,18 @@ def test_team_policy_limits_assignments(service):
     assert {4, 5} == {result[4], result[5]}
 
 
+def test_eighty_player_cross_team_draw_is_bijective(service):
+    game = service.create_game(1, "Host", "Two departments", Mode.HOST,
+                               team_policy="cross", max_members=80)
+    for user_id in range(2, 82):
+        service.join(game.id, user_id, f"Player {user_id}")
+        service.set_member_team(game.id, 1, user_id, "North" if user_id < 42 else "South")
+    result = service.run_draw(game.id, 1)
+    assert len(result) == 80
+    assert set(result) == set(result.values()) == set(range(2, 82))
+    assert all((giver < 42) != (receiver < 42) for giver, receiver in result.items())
+
+
 def test_registration_dates_and_capacity_edits(service):
     now = utcnow()
     game = service.create_game(1, "Host", "Dates", Mode.BLIND)
