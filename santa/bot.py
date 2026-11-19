@@ -1,5 +1,6 @@
+import re
 from datetime import UTC, datetime
-from html import escape
+from html import escape, unescape
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -18,7 +19,7 @@ from aiogram.types import (
 )
 
 from santa.formatting import limited_html, profile_link
-from santa.models import Mode, utcnow
+from santa.models import Game, Mode, utcnow
 from santa.service import AccessDenied, InvalidState, Service
 
 
@@ -52,12 +53,52 @@ GAME_TEXT_FIELDS = {
     "description": ("описание", 2000),
     "rules": ("правила", 3000),
 }
-PROFILE_TEXT_LIMITS = {"wishes": 2000, "interests": 2000, "avoid": 2000,
+PROFILE_TEXT_LIMITS = {"wishes": 500, "interests": 500, "avoid": 500,
                        "wishlist_url": 500}
+CAPTION_BUDGET = 950
 
 
 def expandable_quote(value: str) -> str:
     return f"<blockquote expandable>{escape(value)}</blockquote>"
+
+
+def visible_length(markup: str) -> int:
+    """Count caption characters after Telegram has parsed HTML entities."""
+    plain = unescape(re.sub(r"<[^>]+>", "", markup))
+    return len(plain.encode("utf-16-le")) // 2
+
+
+def game_card_text(game: Game, total: int | None, bot_username: str) -> tuple[str, bool]:
+    lines = [f"🎄 <b>{escape(game.title)}</b>", f"<i>{MODE_NAMES[game.mode]}</i>"]
+    text_sections = []
+    if game.description:
+        text_sections.extend(["", "📝 <b>Описание:</b>", expandable_quote(game.description)])
+    if game.rules:
+        text_sections.extend(["", "📜 <b>Правила:</b>", expandable_quote(game.rules)])
+    lines.extend(["", f"💰 <b>Бюджет:</b> {escape(game.budget)}",
+                  f"🎲 <b>Статус:</b> { {'draft': 'черновик', 'registration': 'регистрация', 'drawn': 'жеребьёвка проведена', 'finished': 'завершена', 'archived': 'архив'}[game.status] }"])
+    if total is not None:
+        lines.extend(["", f"👥 <b>Участников:</b> {total}"])
+        if game.status != "draft":
+            lines.append(f"🔗 <b>Приглашение:</b> <code>https://t.me/{bot_username}?start=join_{game.token}</code>")
+    lines.extend(["", "📅 <b>Время московское</b>"])
+    for label, value in (("Регистрация", game.registration_deadline),
+                         ("Подарок", game.gift_deadline), ("Вручение", game.celebration_at)):
+        lines.append(f"{label} — {display_date(value)}")
+    separate_text = visible_length("\n".join(lines[:2] + text_sections + lines[2:])) > CAPTION_BUDGET
+    if separate_text:
+        for preview_length in (140, 70, 0):
+            text_sections = []
+            for label, value in (("📝 <b>Описание:</b>", game.description),
+                                 ("📜 <b>Правила:</b>", game.rules)):
+                if value:
+                    text_sections.extend(["", label])
+                    if preview_length:
+                        text_sections.append(expandable_quote(
+                            value[:preview_length] + ("…" if len(value) > preview_length else "")))
+            if visible_length("\n".join(lines[:2] + text_sections + lines[2:])) <= CAPTION_BUDGET:
+                break
+    return "\n".join(lines[:2] + text_sections + lines[2:]), separate_text
 
 
 def local_date(value: str) -> datetime:
@@ -120,8 +161,8 @@ def create_router(service: Service, bot_username: str) -> Router:
 
     async def screen(message: Message, text: str, keyboard: InlineKeyboardMarkup | None = None,
                      art: Path | str | None = None) -> Message:
-        # Telegram captions are limited to 1024 characters; long profiles stay text-only.
-        if len(text) > 1000 or (isinstance(art, Path) and not art.is_file()):
+        # Telegram captions are limited to 1024 characters after HTML parsing.
+        if visible_length(text) > CAPTION_BUDGET or (isinstance(art, Path) and not art.is_file()):
             art = None
         media = (art_file_ids.get(art) or FSInputFile(art)) if isinstance(art, Path) else art
 
@@ -141,7 +182,7 @@ def create_router(service: Service, bot_username: str) -> Router:
                                                              reply_markup=keyboard, parse_mode="HTML")
                     await safe_delete(message)
                     return cache_art(replacement)
-                if message.photo and len(text) <= 1000:
+                if message.photo and visible_length(text) <= CAPTION_BUDGET:
                     return await message.edit_caption(caption=text, reply_markup=keyboard,
                                                       parse_mode="HTML")
                 if message.photo:
@@ -195,36 +236,7 @@ def create_router(service: Service, bot_username: str) -> Router:
             return
         game, member, total = view
         helper = service.is_helper(game_id, viewer_id)
-        lines = [f"🎄 <b>{escape(game.title)}</b>",
-                 f"<i>{MODE_NAMES[game.mode]}</i>"]
-        text_sections = []
-        if game.description:
-            text_sections.extend(["", "📝 <b>Описание:</b>", expandable_quote(game.description)])
-        if game.rules:
-            text_sections.extend(["", "📜 <b>Правила:</b>", expandable_quote(game.rules)])
-        lines.extend(["", f"💰 <b>Бюджет:</b> {escape(game.budget)}",
-                       f"🎲 <b>Статус:</b> { {'draft': 'черновик', 'registration': 'регистрация', 'drawn': 'жеребьёвка проведена', 'finished': 'завершена', 'archived': 'архив'}[game.status] }"])
-        if total is not None:
-            lines.extend(["", f"👥 <b>Участников:</b> {total}"])
-            if game.status != "draft":
-                lines.append(f"🔗 <b>Приглашение:</b> <code>https://t.me/{bot_username}?start=join_{game.token}</code>")
-        lines.extend(["", "📅 <b>Время московское</b>"])
-        for label, value in (("Регистрация", game.registration_deadline),
-                             ("Подарок", game.gift_deadline), ("Вручение", game.celebration_at)):
-            lines.append(f"{label} — {display_date(value)}")
-        full_text = "\n".join(lines[:2] + text_sections + lines[2:])
-        separate_text = len(full_text) > 3800
-        if separate_text:
-            text_sections = []
-            if game.description:
-                text_sections.extend(["", "📝 <b>Описание:</b>",
-                                      expandable_quote(game.description[:300] +
-                                                       ("…" if len(game.description) > 300 else ""))])
-            if game.rules:
-                text_sections.extend(["", "📜 <b>Правила:</b>",
-                                      expandable_quote(game.rules[:300] +
-                                                       ("…" if len(game.rules) > 300 else ""))])
-        lines = lines[:2] + text_sections + lines[2:]
+        caption, separate_text = game_card_text(game, total, bot_username)
         buttons = []
         if separate_text:
             if game.description:
@@ -256,7 +268,7 @@ def create_router(service: Service, bot_username: str) -> Router:
             if game.mode != Mode.BLIND.value:
                 buttons.append(("🔐 Распределение", f"pairs:{game_id}"))
         buttons.append(("⬅️ Мои игры", "games"))
-        return await screen(message, "\n".join(lines), kb(*buttons),
+        return await screen(message, caption, kb(*buttons),
                             art=game.cover_file_id or WELCOME_ART)
 
     @router.callback_query(F.data.startswith("gametext:"))
@@ -285,20 +297,25 @@ def create_router(service: Service, bot_username: str) -> Router:
             return
         description = game_.description or "не указано"
         rules = game_.rules or "не указаны"
+        for preview_length in (None, 300, 120, 0):
+            shown_description = description if preview_length is None else description[:preview_length]
+            shown_rules = rules if preview_length is None else rules[:preview_length]
+            invitation = (f"🎄 <b>{limited_html(game_.title, 300)}</b>\n"
+                          f"📝 <b>Описание:</b>\n"
+                          f"{expandable_quote(shown_description + ('…' if len(description) > len(shown_description) else '')) if shown_description else ''}\n"
+                          f"Бюджет: {limited_html(game_.budget, 250)}\n"
+                          f"📜 <b>Правила:</b>\n"
+                          f"{expandable_quote(shown_rules + ('…' if len(rules) > len(shown_rules) else '')) if shown_rules else ''}")
+            if visible_length(invitation) <= CAPTION_BUDGET:
+                break
         buttons = []
-        if len(description) > 700:
+        if len(shown_description) < len(description):
             buttons.append(("📝 Описание полностью", f"invitetext:{token}:description"))
-        if len(rules) > 700:
+        if len(shown_rules) < len(rules):
             buttons.append(("📜 Правила полностью", f"invitetext:{token}:rules"))
         buttons.extend([("Участвовать", f"join:{game_.id}"),
                         ("⬅️ Главное меню", "home")])
-        await screen(message, f"🎄 <b>{limited_html(game_.title, 300)}</b>\n"
-                     f"📝 <b>Описание:</b>\n"
-                     f"{expandable_quote(description[:700] + ('…' if len(description) > 700 else ''))}\n"
-                     f"Бюджет: {limited_html(game_.budget, 250)}\n"
-                     f"📜 <b>Правила:</b>\n"
-                     f"{expandable_quote(rules[:700] + ('…' if len(rules) > 700 else ''))}",
-                     kb(*buttons), art=game_.cover_file_id or WELCOME_ART)
+        await screen(message, invitation, kb(*buttons), art=game_.cover_file_id or WELCOME_ART)
 
     @router.callback_query(F.data.startswith("invitetext:"))
     async def invite_text(call: CallbackQuery):
@@ -659,18 +676,50 @@ def create_router(service: Service, bot_username: str) -> Router:
                          kb(("⬅️ К игре", f"game:{game_id}")))
             return
         receiver, game_ = result
-        await screen(call.message, f"🎁 <b>Твоя миссия</b>\n\n"
-                     f"<b>Получатель:</b> {profile_link(receiver.user_id, receiver.nickname[:70])}\n\n"
-                     f"<b>Пожелания:</b> {limited_html(receiver.wishes or 'не указаны', 1200)}\n\n"
-                     f"<b>Не дарить:</b> {limited_html(receiver.avoid or 'не указано', 1200)}\n\n"
-                     f"<b>Бюджет:</b> {limited_html(game_.budget, 250)}",
-                      kb(("🛍 Выбираю подарок", f"giftstatus:{game_id}:choosing"),
+        wishes = receiver.wishes or "не указаны"
+        avoid = receiver.avoid or "не указано"
+        for preview_length in (None, 250, 100, 0):
+            shown_wishes = wishes if preview_length is None else wishes[:preview_length]
+            shown_avoid = avoid if preview_length is None else avoid[:preview_length]
+            mission_text = (f"🎁 <b>Твоя миссия</b>\n\n"
+                            f"<b>Получатель:</b> {profile_link(receiver.user_id, receiver.nickname[:70])}\n\n"
+                            f"<b>Пожелания:</b> {escape(shown_wishes)}{'…' if len(wishes) > len(shown_wishes) else ''}\n\n"
+                            f"<b>Не дарить:</b> {escape(shown_avoid)}{'…' if len(avoid) > len(shown_avoid) else ''}\n\n"
+                            f"<b>Бюджет:</b> {limited_html(game_.budget, 250)}")
+            if visible_length(mission_text) <= CAPTION_BUDGET:
+                break
+        details_buttons = []
+        if len(shown_wishes) < len(wishes):
+            details_buttons.append(("🎁 Пожелания целиком", f"missiontext:{game_id}:wishes"))
+        if len(shown_avoid) < len(avoid):
+            details_buttons.append(("🚫 Запреты целиком", f"missiontext:{game_id}:avoid"))
+        await screen(call.message, mission_text,
+                      kb(*details_buttons,
+                         ("🛍 Выбираю подарок", f"giftstatus:{game_id}:choosing"),
                          ("🛒 Подарок куплен", f"giftstatus:{game_id}:bought"),
                          ("✅ Подарок готов", f"giftstatus:{game_id}:ready"),
                          ("📮 Подарок отправлен", f"giftstatus:{game_id}:sent"),
                          ("🎁 Подарок вручён", f"giftstatus:{game_id}:given"),
                          ("🎭 Задать вопрос", f"ask:{game_id}"),
                         ("⬅️ К игре", f"game:{game_id}")), art=MISSION_ART)
+
+    @router.callback_query(F.data.startswith("missiontext:"))
+    async def mission_text_detail(call: CallbackQuery):
+        _, game_id_text, field = call.data.split(":")
+        game_id = int(game_id_text)
+        if field not in {"wishes", "avoid"}:
+            await call.answer("Раздел не найден", show_alert=True)
+            return
+        result = service.assignment(game_id, call.from_user.id)
+        if result is None:
+            await call.answer("Нет назначения", show_alert=True)
+            return
+        receiver, _ = result
+        label = "Пожелания" if field == "wishes" else "Не дарить"
+        await call.answer()
+        await screen(call.message, f"<b>{label} получателя</b>\n\n"
+                     + escape(getattr(receiver, field) or "Не указано"),
+                     kb(("⬅️ К миссии", f"mission:{game_id}")))
 
     @router.callback_query(F.data.startswith("giftstatus:"))
     async def gift_status(call: CallbackQuery):

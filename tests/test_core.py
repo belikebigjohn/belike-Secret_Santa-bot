@@ -4,8 +4,9 @@ from datetime import timedelta
 import pytest
 from sqlalchemy import select
 
+from santa.bot import CAPTION_BUDGET, game_card_text, visible_length
 from santa.draw import ImpossibleDraw, draw
-from santa.models import Assignment, Delivery, Mode, User, utcnow
+from santa.models import Assignment, Delivery, Member, Mode, User, utcnow
 from santa.service import AccessDenied, InvalidState, Service
 from santa.worker import recover_stale
 
@@ -88,6 +89,22 @@ def test_profile_is_scoped_to_member(service):
     assert (member.wishes, member.avoid) == ("Чай", "Орехи")
     with pytest.raises(AccessDenied):
         service.profile(game.id, 99, wishes="Чужая анкета")
+
+
+def test_profile_text_limit_is_500_characters(service):
+    game = game_with_players(service)
+    service.profile(game.id, 2, wishes="п" * 500)
+    with pytest.raises(ValueError, match="500 символов"):
+        service.profile(game.id, 2, wishes="п" * 501)
+
+
+def test_long_game_text_keeps_cover_caption_within_limit(service):
+    game = service.create_game(1, "Host", "Ёлка", Mode.BLIND)
+    service.edit_game(game.id, 1, description="О" * 2000, rules="П" * 3000)
+    caption, has_full_text_buttons = game_card_text(service.game(game.id), 80, "santa_bot")
+    assert has_full_text_buttons
+    assert visible_length(caption) <= CAPTION_BUDGET
+    assert "<blockquote expandable>" in caption
 
 
 def test_description_and_rules_accept_documented_limits(service):
@@ -249,7 +266,11 @@ def test_impossible_eighty_player_matching_fails_cleanly():
 def test_draw_notification_stays_within_telegram_limit(service):
     game = service.create_game(1, "Host", "<" * 120, Mode.BLIND, budget="&" * 80)
     service.join(game.id, 2, "<" * 120)
-    service.profile(game.id, 2, wishes="<" * 2000, avoid="&" * 2000)
+    # Existing games may still contain text saved before the shorter profile limit.
+    with service.sessions.begin() as db:
+        member = db.scalar(select(Member).where(Member.game_id == game.id, Member.user_id == 2))
+        member.wishes = "<" * 2000
+        member.avoid = "&" * 2000
     service.run_draw(game.id, 1)
     with service.sessions() as db:
         jobs = db.scalars(select(Delivery).where(Delivery.key.like(f"draw:{game.id}:%"))).all()

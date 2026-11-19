@@ -215,7 +215,7 @@ class Service:
             if member is None:
                 raise AccessDenied("Вы не участвуете в этой игре")
             for key, value in fields.items():
-                limit = 500 if key == "wishlist_url" else 2000
+                limit = 500
                 if len(value) > limit:
                     raise ValueError(f"Текст должен быть не длиннее {limit} символов")
                 setattr(member, key, value.strip())
