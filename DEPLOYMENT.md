@@ -1,6 +1,70 @@
 # Запуск бота для пользователей
 
-Бот работает с одним процессом long polling. Публичный HTTP-порт не нужен. Для сервера требуются Docker с Compose, постоянный том PostgreSQL и доступ к Telegram API.
+Бот работает с одним процессом long polling. Публичный HTTP-порт не нужен. Ниже есть порядок для Mac mini без Docker и для Linux с Docker Compose.
+
+## Mac mini: снова войти по SSH и сделать копию
+
+Откройте PowerShell на своём компьютере и подключитесь к Mac (замените адрес на тот, которым обычно пользуетесь):
+
+```powershell
+ssh belikebigjohn@АДРЕС_MAC
+```
+
+Дальнейшие команды вводите **уже на Mac, в SSH-сессии**. Перейдите в каталог проекта и посмотрите только путь к базе, не показывая токен:
+
+```sh
+cd "$HOME/apps/secret-santa"
+pwd
+grep '^DATABASE_URL=' .env
+```
+
+Если в `.env` стоит `DATABASE_URL=sqlite:///santa.db`, задайте `DB_PATH="$PWD/santa.db"`. Если указан абсолютный путь вроде `sqlite:////Users/belikebigjohn/santa-data/santa.db`, задайте `DB_PATH="$HOME/santa-data/santa.db"`. Не меняйте `DATABASE_URL` ради копии: иначе бот откроет другую базу. Проверьте, что файл действительно существует:
+
+```sh
+DB_PATH="$PWD/santa.db"  # Вариант для DATABASE_URL=sqlite:///santa.db
+ls -lh "$DB_PATH"
+```
+
+Если у вас абсолютный путь, замените только строку `DB_PATH=...` на нужный путь. Затем сделайте копию; бот можно не останавливать, скрипт читает работающую SQLite-базу согласованно:
+
+```sh
+mkdir -p "$HOME/santa-data/backups"
+.venv/bin/python scripts/backup_sqlite.py "$DB_PATH" "$HOME/santa-data/backups/santa-$(date +%Y%m%d-%H%M%S).db"
+ls -lt "$HOME/santa-data/backups" | head
+```
+
+## Mac mini: восстановить выбранную копию
+
+Снова войдите через PowerShell → SSH, перейдите в проект и установите `DB_PATH` точно так же, как выше. Посмотрите список копий и выберите **конкретный** файл:
+
+```sh
+ls -lh "$HOME/santa-data/backups"/santa-*.db
+BACKUP_FILE="$HOME/santa-data/backups/santa-ГГГГММДД-ЧЧММСС.db"
+ls -lh "$BACKUP_FILE" "$DB_PATH"
+```
+
+До восстановления остановите бот. Если он работает через `launchd`, выполните `sudo launchctl bootout system/com.belike.secret-santa`. Если он запущен вручную в открытом терминале, остановите его через `Ctrl+C`. Если старый терминал уже закрыт, проверьте оставшиеся процессы командой `ps aux | grep '[s]anta.main'`; найденный ручной процесс можно остановить `kill PID`, подставив его номер. Убедитесь, что не осталось второго экземпляра с этим токеном.
+
+Если файла `scripts/restore_sqlite.py` на Mac ещё нет, сначала сделайте обычную копию базы по предыдущему разделу, остановите бот и выполните `git pull --ff-only origin main`. Когда бот остановлен и скрипт есть, выполните:
+
+```sh
+.venv/bin/python scripts/restore_sqlite.py "$BACKUP_FILE" "$DB_PATH"
+.venv/bin/python -m santa.healthcheck
+```
+
+Скрипт проверяет копию и **перед восстановлением сохраняет текущую базу** рядом с ней под именем `santa.before-restore-...db`; точный путь он напечатает. Данные, появившиеся после выбранной копии, пропадут из рабочей базы, но останутся в этом страховочном файле. При старте бот применит недостающие миграции.
+
+Верните бот в работу **тем же способом, которым он запускался до остановки**:
+
+```sh
+sudo launchctl bootstrap system /Library/LaunchDaemons/com.belike.secret-santa.plist
+```
+
+Команда выше нужна только для `launchd`. Для ручного запуска используйте `.venv/bin/python -m santa.main`, но после закрытия SSH-сессии такой процесс может остановиться; для постоянной работы настройте `launchd` по [инструкции для Mac mini](MACOS_DEPLOYMENT.md). Не запускайте оба способа одновременно.
+
+## Linux с Docker Compose
+
+Для этого варианта требуются Docker с Compose, постоянный том PostgreSQL и доступ к Telegram API.
 
 ## Перед запуском
 
