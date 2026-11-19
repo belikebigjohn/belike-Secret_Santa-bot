@@ -23,9 +23,9 @@ def test_alembic_creates_fresh_schema_and_is_repeatable(tmp_path):
         migrate(connection)
         migrate(connection)
         tables = set(inspect(connection).get_table_names())
-        assert {"users", "games", "members", "assignments", "deliveries",
+        assert {"users", "games", "members", "removed_members", "assignments", "deliveries",
                 "broadcasts", "alembic_version"} <= tables
-        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0003_delivery_queue_index"
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0004_removed_members"
         assert "ix_deliveries_state_due" in {
             item["name"] for item in inspect(connection).get_indexes("deliveries")}
 
@@ -70,3 +70,15 @@ def test_removed_game_jobs_are_cancelled_on_upgrade(tmp_path):
         states = dict(connection.execute(text("SELECT key, state FROM deliveries")).all())
         assert states["draw:1:7"] == "pending"
         assert all(states[key] == "cancelled" for key in states if key != "draw:1:7")
+
+
+def test_alembic_adds_removed_members_to_existing_database(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'existing.db'}")
+    with engine.begin() as connection:
+        migrate(connection, "0003_delivery_queue_index")
+        connection.execute(text("DROP TABLE removed_members"))
+        migrate(connection)
+        assert "removed_members" in inspect(connection).get_table_names()
+        assert "ix_removed_members_game_id" in {
+            item["name"] for item in inspect(connection).get_indexes("removed_members")
+        }

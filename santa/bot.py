@@ -722,7 +722,10 @@ def create_router(service: Service, bot_username: str) -> Router:
         page = max(0, int(parts[2])) if len(parts) > 2 else 0
         try:
             people = service.members(game_id, call.from_user.id)
-            registration = service.game(game_id).status == "registration"
+            page = min(page, max(0, (len(people) - 1) // 8))
+            game_ = service.game(game_id)
+            registration = game_.status == "registration"
+            host_can_remove = registration and game_.host_id == call.from_user.id
             await call.answer()
             await screen(call.message, f"👥 <b>Участники: {len(people)}</b>\n\n" + "\n".join(
                 f"{i}. {profile_link(p.user_id, p.nickname[:55])}"
@@ -735,8 +738,110 @@ def create_router(service: Service, bot_username: str) -> Router:
                      for i, p in enumerate(page_slice(people, page), page * 8 + 1)
                      if not p.approved and registration],
                    *page_buttons(f"members:{game_id}", page, len(people)),
+                   *(("🗑 Управление составом", f"remove:{game_id}:0"),) if host_can_remove else (),
                    ("⬅️ К игре", f"game:{game_id}")))
         except AccessDenied as exc:
+            await call.answer(str(exc), show_alert=True)
+
+    async def show_removal_list(message: Message, game_id: int, host_id: int, page: int):
+        game_ = service.game(game_id)
+        people = service.members(game_id, host_id)
+        if game_.status != "registration" or game_.host_id != host_id:
+            raise AccessDenied("Удалять участников может только ведущий до жеребьёвки")
+        candidates = [person for person in people if person.user_id != host_id]
+        page = min(max(page, 0), max(0, (len(candidates) - 1) // 8))
+        current = page_slice(candidates, page)
+        removed_count = len(service.removed_members(game_id, host_id))
+        await screen(message,
+                     f"🗑 <b>Управление составом: {len(candidates)}</b>\n\n"
+                     "Выберите участника. Исключённый не сможет войти по старой ссылке.\n\n"
+                     + ("\n".join(f"{number}. {profile_link(person.user_id, person.nickname[:55])}"
+                                  for number, person in enumerate(current, page * 8 + 1))
+                        or "Других участников нет."),
+                     kb(*[(f"🗑 №{number}", f"removeprompt:{game_id}:{person.user_id}:{page}")
+                          for number, person in enumerate(current, page * 8 + 1)],
+                        *page_buttons(f"remove:{game_id}", page, len(candidates)),
+                        *((f"🚫 Исключённые: {removed_count}", f"removed:{game_id}:0"),)
+                        if removed_count else (),
+                        ("⬅️ К участникам", f"members:{game_id}:{page}")))
+
+    @router.callback_query(F.data.startswith("remove:"))
+    async def removal_list(call: CallbackQuery):
+        _, game_text, page_text = call.data.split(":")
+        try:
+            await show_removal_list(call.message, int(game_text), call.from_user.id, int(page_text))
+            await call.answer()
+        except (AccessDenied, ValueError) as exc:
+            await call.answer(str(exc), show_alert=True)
+
+    @router.callback_query(F.data.startswith("removeprompt:"))
+    async def remove_prompt(call: CallbackQuery):
+        _, game_text, user_text, page_text = call.data.split(":")
+        game_id, user_id = int(game_text), int(user_text)
+        try:
+            game_ = service.game(game_id)
+            people = service.members(game_id, call.from_user.id)
+            if game_.host_id != call.from_user.id or game_.status != "registration":
+                raise AccessDenied("Удалять участников может только ведущий до жеребьёвки")
+            person = next((item for item in people if item.user_id == user_id), None)
+            if person is None or person.user_id == game_.host_id:
+                raise ValueError("Участник не найден")
+            await call.answer()
+            await screen(call.message, "🗑 Исключить из игры "
+                         f"{profile_link(person.user_id, person.nickname)}?\n\n"
+                         "Его анкета и права помощника будут удалены. "
+                         "Повторно вступить по приглашению он не сможет, пока вы не вернёте доступ.",
+                         kb(("✅ Подтвердить удаление", f"removeconfirm:{game_id}:{user_id}:{page_text}"),
+                            ("⬅️ К списку", f"remove:{game_id}:{page_text}")))
+        except (AccessDenied, ValueError) as exc:
+            await call.answer(str(exc), show_alert=True)
+
+    @router.callback_query(F.data.startswith("removeconfirm:"))
+    async def remove_confirm(call: CallbackQuery):
+        _, game_text, user_text, page_text = call.data.split(":")
+        game_id = int(game_text)
+        try:
+            service.remove_member(game_id, call.from_user.id, int(user_text))
+            await call.answer("Участник исключён")
+            await show_removal_list(call.message, game_id, call.from_user.id, int(page_text))
+        except (AccessDenied, ValueError) as exc:
+            await call.answer(str(exc), show_alert=True)
+
+    @router.callback_query(F.data.startswith("removed:"))
+    async def removed_list(call: CallbackQuery):
+        _, game_text, page_text = call.data.split(":")
+        game_id = int(game_text)
+        try:
+            game_ = service.game(game_id)
+            removed = service.removed_members(game_id, call.from_user.id)
+            if game_.status != "registration":
+                raise InvalidState("Регистрация закрыта")
+            page = min(max(int(page_text), 0), max(0, (len(removed) - 1) // 8))
+            current = page_slice(removed, page)
+            await call.answer()
+            await screen(call.message, f"🚫 <b>Исключённые: {len(removed)}</b>\n\n"
+                         "Верните доступ, если человек должен снова вступить по приглашению.\n\n"
+                         + ("\n".join(f"{number}. {profile_link(item.user_id, item.name[:55])}"
+                                      for number, item in enumerate(current, page * 8 + 1))
+                            or "Список пуст."),
+                         kb(*[(f"Вернуть №{number}", f"restore:{game_id}:{item.user_id}:{page}")
+                              for number, item in enumerate(current, page * 8 + 1)],
+                            *page_buttons(f"removed:{game_id}", page, len(removed)),
+                            ("⬅️ К управлению", f"remove:{game_id}:0")))
+        except (AccessDenied, ValueError) as exc:
+            await call.answer(str(exc), show_alert=True)
+
+    @router.callback_query(F.data.startswith("restore:"))
+    async def restore_member(call: CallbackQuery):
+        _, game_text, user_text, page_text = call.data.split(":")
+        game_id = int(game_text)
+        try:
+            service.restore_member_access(game_id, call.from_user.id, int(user_text))
+            await call.answer("Доступ восстановлен")
+            await screen(call.message, "✅ Доступ восстановлен. Вступить можно, пока регистрация открыта.",
+                         kb(("⬅️ К исключённым", f"removed:{game_id}:{page_text}"),
+                            ("⬅️ К участникам", f"members:{game_id}")))
+        except (AccessDenied, ValueError) as exc:
             await call.answer(str(exc), show_alert=True)
 
     @router.callback_query(F.data.startswith("settings:"))

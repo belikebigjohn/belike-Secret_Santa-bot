@@ -23,6 +23,7 @@ from santa.models import (
     Mode,
     Question,
     QuestionMute,
+    RemovedMember,
     ReplacementInvite,
     User,
     utcnow,
@@ -190,6 +191,9 @@ class Service:
                 raise InvalidState("Регистрация в эту игру закрыта")
             if game.host_id == user_id and game.mode == Mode.HOST.value:
                 raise InvalidState("В этом режиме ведущий не участвует")
+            if db.scalar(select(RemovedMember.id).where(RemovedMember.game_id == game_id,
+                                                        RemovedMember.user_id == user_id)):
+                raise InvalidState("Ведущий исключил вас из этой игры")
             self.user(db, user_id, name)
             member = db.scalar(select(Member).where(Member.game_id == game_id, Member.user_id == user_id))
             if member is None:
@@ -205,6 +209,55 @@ class Service:
     def member(self, game_id: int, user_id: int) -> Member | None:
         with self.sessions() as db:
             return db.scalar(select(Member).where(Member.game_id == game_id, Member.user_id == user_id))
+
+    def removed_members(self, game_id: int, host_id: int) -> list[RemovedMember]:
+        with self.sessions() as db:
+            self._require_host(self._game(db, game_id), host_id)
+            return list(db.scalars(select(RemovedMember).where(
+                RemovedMember.game_id == game_id).order_by(RemovedMember.id)))
+
+    def remove_member(self, game_id: int, host_id: int, user_id: int) -> None:
+        with self.sessions.begin() as db:
+            game = self._game(db, game_id, lock=True)
+            self._require_host(game, host_id)
+            if game.status != "registration":
+                raise InvalidState("После жеребьёвки используйте замену участника")
+            if user_id == game.host_id:
+                raise InvalidState("Ведущий не может удалить себя из игры")
+            member = db.scalar(select(Member).where(Member.game_id == game_id,
+                                                     Member.user_id == user_id))
+            if member is None:
+                raise ValueError("Участник уже удалён или не найден")
+            db.execute(delete(GameHelper).where(GameHelper.game_id == game_id,
+                                                GameHelper.user_id == user_id))
+            db.execute(delete(Exclusion).where(Exclusion.game_id == game_id,
+                (Exclusion.giver_id == user_id) | (Exclusion.receiver_id == user_id)))
+            for job in db.scalars(select(Delivery).where(
+                    Delivery.key.like(f"review:{game_id}:{user_id}:%"),
+                    Delivery.state == "pending")):
+                job.state = "cancelled"
+            db.add(RemovedMember(game_id=game_id, user_id=user_id, name=member.nickname))
+            db.delete(member)
+            db.add(Delivery(key=f"member-removed:{game_id}:{user_id}:{secrets.token_hex(4)}",
+                            user_id=user_id,
+                            text=f"Ведущий исключил вас из игры «{game.title}». "
+                                 "Повторно вступить по старой ссылке нельзя."))
+
+    def restore_member_access(self, game_id: int, host_id: int, user_id: int) -> None:
+        with self.sessions.begin() as db:
+            game = self._game(db, game_id, lock=True)
+            self._require_host(game, host_id)
+            if game.status != "registration":
+                raise InvalidState("Регистрация закрыта")
+            removed = db.scalar(select(RemovedMember).where(RemovedMember.game_id == game_id,
+                                                              RemovedMember.user_id == user_id))
+            if removed is None:
+                raise ValueError("Участник не найден среди исключённых")
+            db.delete(removed)
+            db.add(Delivery(key=f"member-restored:{game_id}:{user_id}:{secrets.token_hex(4)}",
+                            user_id=user_id,
+                            text=f"Ведущий снова разрешил вам вступить в игру «{game.title}». "
+                                 "Если регистрация открыта, нажмите «Участвовать» в приглашении."))
 
     def profile(self, game_id: int, user_id: int, **fields: str) -> None:
         allowed = {"nickname", "wishes", "interests", "avoid", "wishlist_url"}
@@ -353,14 +406,15 @@ class Service:
                 raise InvalidState("Сначала завершите игру")
             question_ids = list(db.scalars(select(Question.id).where(Question.game_id == game_id)))
             delivery_filters = [Delivery.key.like(f"{prefix}:{game_id}:%") for prefix in
-                                ("draw", "announcement", "reminder", "daily", "review", "replacement")]
+                                ("draw", "announcement", "reminder", "daily", "review", "replacement",
+                                 "member-removed", "member-restored")]
             for question_id in question_ids:
                 delivery_filters.extend((Delivery.key == f"question:{question_id}",
                                          Delivery.key == f"answer:{question_id}",
                                          Delivery.key == f"question-report:{question_id}"))
             db.execute(delete(Delivery).where(or_(*delivery_filters)))
             for model in (Question, QuestionMute, Assignment, Exclusion, GameHelper,
-                          ReplacementInvite, Member):
+                          ReplacementInvite, RemovedMember, Member):
                 db.execute(delete(model).where(model.game_id == game_id))
             db.delete(game)
 

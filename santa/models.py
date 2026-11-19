@@ -90,6 +90,15 @@ class Member(Base):
     received: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
+class RemovedMember(Base):
+    __tablename__ = "removed_members"
+    __table_args__ = (UniqueConstraint("game_id", "user_id"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    game_id: Mapped[int] = mapped_column(ForeignKey("games.id", ondelete="CASCADE"), index=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
+    name: Mapped[str] = mapped_column(String(120))
+
+
 class GameHelper(Base):
     __tablename__ = "game_helpers"
     __table_args__ = (UniqueConstraint("game_id", "user_id"),)

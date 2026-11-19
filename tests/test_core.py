@@ -6,7 +6,7 @@ from sqlalchemy import select
 
 from santa.bot import CAPTION_BUDGET, game_card_text, game_detail_text, visible_length
 from santa.draw import ImpossibleDraw, draw
-from santa.models import Assignment, Delivery, Member, Mode, User, utcnow
+from santa.models import Assignment, Delivery, Member, Mode, RemovedMember, User, utcnow
 from santa.service import AccessDenied, InvalidState, Service
 from santa.worker import recover_stale
 
@@ -299,6 +299,58 @@ def test_capacity_and_approval_gate_draw(service):
     service.review_member(game.id, 1, 2, True)
     service.review_member(game.id, 1, 3, True)
     assert len(service.run_draw(game.id, 1)) == 2
+
+
+def test_host_removes_member_and_can_restore_access_before_draw(service):
+    game = game_with_players(service)
+    service.set_helper(game.id, 1, 2, True)
+    service.add_exclusion(game.id, 1, 2, 3)
+    with pytest.raises(AccessDenied):
+        service.remove_member(game.id, 2, 3)
+    with pytest.raises(InvalidState, match="Ведущий"):
+        service.remove_member(game.id, 1, 1)
+
+    service.remove_member(game.id, 1, 2)
+
+    assert service.member(game.id, 2) is None
+    assert not service.is_helper(game.id, 2)
+    assert service.exclusions(game.id, 1) == []
+    assert [item.user_id for item in service.removed_members(game.id, 1)] == [2]
+    with pytest.raises(InvalidState, match="исключил"):
+        service.join(game.id, 2, "Two")
+    with pytest.raises(ValueError, match="уже удалён"):
+        service.remove_member(game.id, 1, 2)
+
+    service.restore_member_access(game.id, 1, 2)
+    assert service.removed_members(game.id, 1) == []
+    assert service.join(game.id, 2, "Two").user_id == 2
+    service.run_draw(game.id, 1)
+    with pytest.raises(InvalidState, match="замену"):
+        service.remove_member(game.id, 1, 2)
+
+
+def test_eighty_member_removal_keeps_draw_bijection(service):
+    game = service.create_game(1, "Host", "Company", Mode.HOST)
+    for user_id in range(2, 82):
+        service.join(game.id, user_id, f"Player {user_id}")
+    assert len(service.members(game.id, 1)) == 80
+
+    service.remove_member(game.id, 1, 42)
+
+    assert len(service.members(game.id, 1)) == 79
+    assignments = service.run_draw(game.id, 1)
+    assert len(assignments) == len(set(assignments)) == len(set(assignments.values())) == 79
+    assert 42 not in assignments and 42 not in assignments.values()
+
+
+def test_archiving_clears_removed_member_records(service):
+    game = game_with_players(service)
+    service.remove_member(game.id, 1, 2)
+    service.run_draw(game.id, 1)
+    service.close_game(game.id, 1)
+    service.archive_game(game.id, 1)
+    with service.sessions() as db:
+        assert db.scalars(select(RemovedMember).where(RemovedMember.game_id == game.id)).all() == []
 
 
 
