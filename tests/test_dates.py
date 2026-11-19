@@ -2,7 +2,7 @@ from datetime import datetime
 
 import pytest
 
-from santa.bot import display_date, kb, local_date, page_buttons, page_slice
+from santa.bot import display_date, expandable_quote, kb, local_date, page_buttons, page_slice
 from santa.formatting import limited_html, profile_link
 
 
@@ -39,3 +39,9 @@ def test_html_snippet_keeps_entities_intact():
     assert len(result) <= 1000
     assert result.endswith("…")
     assert result.count("&lt;") == 249
+
+
+def test_expandable_quote_escapes_user_text():
+    assert expandable_quote("Правило <сюрприз> & подарок") == (
+        "<blockquote expandable>Правило &lt;сюрприз&gt; &amp; подарок</blockquote>"
+    )

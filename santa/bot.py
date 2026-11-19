@@ -47,6 +47,17 @@ MISSION_ART = POSTER.with_name("mission.png")
 MODE_NAMES = {"blind": "🎁 Играю вслепую", "open": "🎩 Играю и всё знаю",
               "host": "👑 Только организатор"}
 MOSCOW = ZoneInfo("Europe/Moscow")
+GAME_TEXT_FIELDS = {
+    "title": ("название", 120),
+    "description": ("описание", 2000),
+    "rules": ("правила", 3000),
+}
+PROFILE_TEXT_LIMITS = {"wishes": 2000, "interests": 2000, "avoid": 2000,
+                       "wishlist_url": 500}
+
+
+def expandable_quote(value: str) -> str:
+    return f"<blockquote expandable>{escape(value)}</blockquote>"
 
 
 def local_date(value: str) -> datetime:
@@ -186,10 +197,11 @@ def create_router(service: Service, bot_username: str) -> Router:
         helper = service.is_helper(game_id, viewer_id)
         lines = [f"🎄 <b>{escape(game.title)}</b>",
                  f"<i>{MODE_NAMES[game.mode]}</i>"]
+        text_sections = []
         if game.description:
-            lines.extend(["", escape(game.description[:300])])
+            text_sections.extend(["", "📝 <b>Описание:</b>", expandable_quote(game.description)])
         if game.rules:
-            lines.extend(["", f"📜 <b>Правила:</b> {escape(game.rules[:300])}"])
+            text_sections.extend(["", "📜 <b>Правила:</b>", expandable_quote(game.rules)])
         lines.extend(["", f"💰 <b>Бюджет:</b> {escape(game.budget)}",
                        f"🎲 <b>Статус:</b> { {'draft': 'черновик', 'registration': 'регистрация', 'drawn': 'жеребьёвка проведена', 'finished': 'завершена', 'archived': 'архив'}[game.status] }"])
         if total is not None:
@@ -200,7 +212,25 @@ def create_router(service: Service, bot_username: str) -> Router:
         for label, value in (("Регистрация", game.registration_deadline),
                              ("Подарок", game.gift_deadline), ("Вручение", game.celebration_at)):
             lines.append(f"{label} — {display_date(value)}")
+        full_text = "\n".join(lines[:2] + text_sections + lines[2:])
+        separate_text = len(full_text) > 3800
+        if separate_text:
+            text_sections = []
+            if game.description:
+                text_sections.extend(["", "📝 <b>Описание:</b>",
+                                      expandable_quote(game.description[:300] +
+                                                       ("…" if len(game.description) > 300 else ""))])
+            if game.rules:
+                text_sections.extend(["", "📜 <b>Правила:</b>",
+                                      expandable_quote(game.rules[:300] +
+                                                       ("…" if len(game.rules) > 300 else ""))])
+        lines = lines[:2] + text_sections + lines[2:]
         buttons = []
+        if separate_text:
+            if game.description:
+                buttons.append(("📝 Описание полностью", f"gametext:{game_id}:description"))
+            if game.rules:
+                buttons.append(("📜 Правила полностью", f"gametext:{game_id}:rules"))
         if member:
             buttons.extend([("📝 Анкета", f"profile:{game_id}"), ("🎅 Моя миссия", f"mission:{game_id}")])
             if game.status == "drawn":
@@ -229,6 +259,66 @@ def create_router(service: Service, bot_username: str) -> Router:
         return await screen(message, "\n".join(lines), kb(*buttons),
                             art=game.cover_file_id or WELCOME_ART)
 
+    @router.callback_query(F.data.startswith("gametext:"))
+    async def game_text(call: CallbackQuery):
+        _, game_id_text, field = call.data.split(":")
+        game_id = int(game_id_text)
+        if field not in {"description", "rules"}:
+            await call.answer("Раздел не найден", show_alert=True)
+            return
+        view = service.game_view(game_id, call.from_user.id)
+        if view is None:
+            await call.answer("Нет доступа", show_alert=True)
+            return
+        game_, _, _ = view
+        label = "Описание" if field == "description" else "Правила"
+        await call.answer()
+        await screen(call.message, f"<b>{label} игры «{escape(game_.title)}»</b>\n\n"
+                     + expandable_quote(getattr(game_, field) or "Не указаны"),
+                     kb(("⬅️ К игре", f"game:{game_id}")))
+
+    async def show_invite(message: Message, token: str):
+        game_ = service.game_by_token(token)
+        if game_ is None:
+            await screen(message, "Приглашение больше не действует.",
+                         kb(("⬅️ Главное меню", "home")))
+            return
+        description = game_.description or "не указано"
+        rules = game_.rules or "не указаны"
+        buttons = []
+        if len(description) > 700:
+            buttons.append(("📝 Описание полностью", f"invitetext:{token}:description"))
+        if len(rules) > 700:
+            buttons.append(("📜 Правила полностью", f"invitetext:{token}:rules"))
+        buttons.extend([("Участвовать", f"join:{game_.id}"),
+                        ("⬅️ Главное меню", "home")])
+        await screen(message, f"🎄 <b>{limited_html(game_.title, 300)}</b>\n"
+                     f"📝 <b>Описание:</b>\n"
+                     f"{expandable_quote(description[:700] + ('…' if len(description) > 700 else ''))}\n"
+                     f"Бюджет: {limited_html(game_.budget, 250)}\n"
+                     f"📜 <b>Правила:</b>\n"
+                     f"{expandable_quote(rules[:700] + ('…' if len(rules) > 700 else ''))}",
+                     kb(*buttons), art=game_.cover_file_id or WELCOME_ART)
+
+    @router.callback_query(F.data.startswith("invitetext:"))
+    async def invite_text(call: CallbackQuery):
+        _, token, field = call.data.split(":")
+        game_ = service.game_by_token(token)
+        if game_ is None or field not in {"description", "rules"}:
+            await call.answer("Приглашение недоступно", show_alert=True)
+            return
+        label = "Описание" if field == "description" else "Правила"
+        await call.answer()
+        await screen(call.message, f"<b>{label} игры «{escape(game_.title)}»</b>\n\n"
+                     + expandable_quote(getattr(game_, field) or "Не указаны"),
+                     kb(("Участвовать", f"join:{game_.id}"),
+                        ("⬅️ К приглашению", f"inviteback:{token}")))
+
+    @router.callback_query(F.data.startswith("inviteback:"))
+    async def invite_back(call: CallbackQuery):
+        await call.answer()
+        await show_invite(call.message, call.data.split(":", 1)[1])
+
     @router.message(CommandStart())
     async def start(message: Message, state: FSMContext):
         await state.clear()
@@ -247,14 +337,8 @@ def create_router(service: Service, bot_username: str) -> Router:
                 return
         if message.text and "join_" in message.text:
             token = message.text.split("join_", 1)[1].split()[0]
-            game = service.game_by_token(token)
-            if game:
-                await screen(message, f"🎄 <b>{limited_html(game.title, 300)}</b>\n"
-                             f"{limited_html(game.description, 700)}\n"
-                             f"Бюджет: {limited_html(game.budget, 250)}\n"
-                             f"Правила: {limited_html(game.rules or 'не указаны', 700)}",
-                             kb(("Участвовать", f"join:{game.id}"),
-                                ("⬅️ Главное меню", "home")), art=game.cover_file_id or WELCOME_ART)
+            if service.game_by_token(token):
+                await show_invite(message, token)
                 return
         await screen(message, "🎅 <b>Тайный Санта</b>\n\nСоздайте игру или откройте свои игры.",
                      kb(("🎄 Создать игру", "create"), ("🎁 Мои игры", "games")), art=WELCOME_ART)
@@ -298,7 +382,7 @@ def create_router(service: Service, bot_username: str) -> Router:
         await call.answer()
         await state.update_data(mode=call.data.split(":")[1])
         await state.set_state(Form.title)
-        panel = await screen(call.message, "✏️ <b>Название игры</b>\n\nОтправьте название одним сообщением.",
+        panel = await screen(call.message, "✏️ <b>Название игры</b>\n\nОтправьте название одним сообщением (до 120 символов).",
                              kb(("⬅️ Назад", "create")))
         await remember(state, panel)
 
@@ -307,8 +391,8 @@ def create_router(service: Service, bot_username: str) -> Router:
         await call.answer()
         step = call.data.split(":")[1]
         prompts = {
-            "title": (Form.title, "✏️ <b>Название игры</b>\n\nОтправьте название одним сообщением.", "create"),
-            "budget": (Form.budget, "💰 <b>Бюджет подарка</b>\n\nНапример: до 2000 ₽", "wizard:title"),
+            "title": (Form.title, "✏️ <b>Название игры</b>\n\nОтправьте название одним сообщением (до 120 символов).", "create"),
+            "budget": (Form.budget, "💰 <b>Бюджет подарка</b>\n\nНапример: до 2000 ₽. До 80 символов.", "wizard:title"),
             "registration": (Form.registration_date, ("📅 <b>Когда закончится регистрация?</b>\n\n"
                              "Одна дата: <code>01.12.2026</code>\n<i>18:00 по Москве.</i>"), "wizard:budget"),
             "gift": (Form.gift_date, ("🎁 <b>К какому дню подготовить подарок?</b>\n\n"
@@ -333,7 +417,7 @@ def create_router(service: Service, bot_username: str) -> Router:
             return
         await state.update_data(title=message.text.strip())
         await next_step(message, state, Form.budget,
-                        "💰 <b>Бюджет подарка</b>\n\nНапример: до 2000 ₽", "wizard:title")
+                        "💰 <b>Бюджет подарка</b>\n\nНапример: до 2000 ₽. До 80 символов.", "wizard:title")
 
     @router.message(Form.budget)
     async def budget(message: Message, state: FSMContext):
@@ -540,8 +624,10 @@ def create_router(service: Service, bot_username: str) -> Router:
         await call.answer()
         await state.update_data(game_id=game_id, field=field)
         await state.set_state(Form.profile)
+        limit = PROFILE_TEXT_LIMITS[field]
         panel = await screen(call.message, "📝 <b>Редактирование анкеты</b>\n\n"
-                             "Отправьте новое значение одним сообщением. Для очистки отправьте «-».",
+                             f"Отправьте новое значение (до {limit} символов) одним сообщением. "
+                             "Для очистки отправьте «-».",
                              kb(("⬅️ К анкете", f"profile:{game_id}")))
         await remember(state, panel)
 
@@ -694,7 +780,7 @@ def create_router(service: Service, bot_username: str) -> Router:
         await state.set_state(Form.edit_budget)
         panel = await screen(call.message,
                              f"💰 <b>Изменить бюджет</b>\n\nСейчас: {escape(game_.budget)}\n\n"
-                             "Напишите новый бюджет и валюту.",
+                             "Напишите новый бюджет и валюту (до 80 символов).",
                              kb(("⬅️ К настройкам", f"settings:{game_id}")))
         await remember(state, panel)
 
@@ -998,7 +1084,8 @@ def create_router(service: Service, bot_username: str) -> Router:
             return
         await state.set_state(Form.admin_date)
         await call.answer()
-        panel = await screen(call.message, "📅 Укажите дату ДД.ММ.ГГГГ. Время отправки — 18:00 по Москве.")
+        panel = await screen(call.message, "📅 Укажите одну дату в формате ДД.ММ.ГГГГ. "
+                             "Время отправки — 18:00 по Москве.")
         await remember(state, panel)
 
     @router.message(Form.admin_date)
@@ -1033,6 +1120,7 @@ def create_router(service: Service, bot_username: str) -> Router:
         await state.set_state(Form.admin_link)
         await update_panel(message, state, "🔗 Если нужна кнопка, отправьте строку вида "
                            "<code>Открыть сайт | https://example.com</code>. "
+                           "Название — до 64 символов, ссылка — до 500. "
                            "Без кнопки отправьте <code>-</code>.")
 
     @router.message(Form.admin_link)
@@ -1221,13 +1309,19 @@ def create_router(service: Service, bot_username: str) -> Router:
         _, game_id_text, field = call.data.split(":")
         game_id = int(game_id_text)
         game_ = service.game(game_id)
-        if game_ is None or game_.host_id != call.from_user.id or game_.status not in {"registration", "draft"}:
+        if (game_ is None or game_.host_id != call.from_user.id or
+                game_.status not in {"registration", "draft"} or
+                field not in {*GAME_TEXT_FIELDS, "cover_file_id"}):
             await call.answer("Настройки недоступны", show_alert=True)
             return
         await call.answer()
         await state.update_data(game_id=game_id, field=field)
         await state.set_state(Form.edit_game)
-        prompt = "Отправьте фотографию" if field == "cover_file_id" else "Отправьте новый текст (для очистки — «-»)"
+        if field == "cover_file_id":
+            prompt = "Отправьте фотографию или «-» для удаления обложки"
+        else:
+            label, limit = GAME_TEXT_FIELDS[field]
+            prompt = f"Отправьте {label} одним сообщением (до {limit} символов); для очистки — «-»"
         panel = await screen(call.message, f"✏️ <b>Настройка игры</b>\n\n{prompt}.",
                              kb(("⬅️ К настройкам", f"settings:{game_id}")))
         await remember(state, panel)
@@ -1375,7 +1469,8 @@ def create_router(service: Service, bot_username: str) -> Router:
         await call.answer()
         await state.update_data(game_id=game_id)
         await state.set_state(Form.ask)
-        panel = await screen(call.message, "🎭 Напишите вопрос получателю. Ваше имя не будет показано.",
+        panel = await screen(call.message, "🎭 Напишите вопрос получателю (до 1000 символов). "
+                             "Ваше имя не будет показано.",
                              kb(("⬅️ К вопросам", f"questions:{game_id}")))
         await remember(state, panel)
 
@@ -1397,7 +1492,7 @@ def create_router(service: Service, bot_username: str) -> Router:
         await call.answer()
         await state.update_data(question_id=question_id)
         await state.set_state(Form.answer)
-        panel = await screen(call.message, "🎭 Напишите ответ на вопрос.")
+        panel = await screen(call.message, "🎭 Напишите ответ на вопрос (до 1000 символов).")
         await remember(state, panel)
 
     @router.message(Form.answer)

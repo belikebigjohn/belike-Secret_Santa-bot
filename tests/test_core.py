@@ -90,6 +90,17 @@ def test_profile_is_scoped_to_member(service):
         service.profile(game.id, 99, wishes="Чужая анкета")
 
 
+def test_description_and_rules_accept_documented_limits(service):
+    game = service.create_game(1, "Host", "Holiday", Mode.BLIND)
+    service.edit_game(game.id, 1, description="О" * 2000, rules="П" * 3000)
+    assert len(service.game(game.id).description) == 2000
+    assert len(service.game(game.id).rules) == 3000
+    with pytest.raises(ValueError, match="до 2000 символов"):
+        service.edit_game(game.id, 1, description="О" * 2001)
+    with pytest.raises(ValueError, match="до 3000 символов"):
+        service.edit_game(game.id, 1, rules="П" * 3001)
+
+
 
 def test_change_mode_and_budget_before_draw(service):
     game = game_with_players(service)

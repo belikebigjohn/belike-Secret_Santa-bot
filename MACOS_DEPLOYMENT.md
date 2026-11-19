@@ -130,12 +130,19 @@ cd "$APP_DIR"
 .venv/bin/python scripts/backup_sqlite.py "$DATA_DIR/santa.db" "$DATA_DIR/backups/santa-$(date +%Y%m%d-%H%M%S).db"
 ```
 
-Периодически переносите копии на другой носитель или сервер: файл на том же Mac не защитит от потери диска. Для обновления кода после копии остановите сервис, обновите `main` и запустите его снова:
+Периодически переносите копии на другой носитель или сервер: файл на том же Mac не защитит от потери диска. Сначала сохраните изменения на рабочем компьютере коммитом и отправьте их в `origin/main`. `git pull` на Mac получит только уже отправленные коммиты.
+
+Если бот сейчас запущен вручную в SSH-окне, остановите его сочетанием `Ctrl+C`. Если бот уже работает как сервис `launchd`, остановите его командой `sudo launchctl bootout system/com.belike.secret-santa`. Перед обновлением сделайте копию базы командой выше. Затем выполните на Mac:
 
 ```sh
-sudo launchctl bootout system/com.belike.secret-santa
+cd "$HOME/apps/secret-santa"
 git pull --ff-only origin main
 .venv/bin/python -m pip install -e .
+```
+
+Для ручного запуска после обновления выполните `.venv/bin/python -m santa.main`. Если используете `launchd`, снова запустите сервис и проверьте базу:
+
+```sh
 sudo launchctl bootstrap system /Library/LaunchDaemons/com.belike.secret-santa.plist
 .venv/bin/python -m santa.healthcheck
 ```

@@ -215,8 +215,9 @@ class Service:
             if member is None:
                 raise AccessDenied("Вы не участвуете в этой игре")
             for key, value in fields.items():
-                if len(value) > (500 if key == "wishlist_url" else 2000):
-                    raise ValueError("Текст слишком длинный")
+                limit = 500 if key == "wishlist_url" else 2000
+                if len(value) > limit:
+                    raise ValueError(f"Текст должен быть не длиннее {limit} символов")
                 setattr(member, key, value.strip())
 
     def set_mode(self, game_id: int, host_id: int, mode: Mode) -> None:
@@ -255,7 +256,8 @@ class Service:
             for key, value in fields.items():
                 value = value.strip()
                 if len(value) > limits[key] or (key == "title" and not value):
-                    raise ValueError("Проверьте длину текста")
+                    prefix = "Текст должен быть от 1 до" if key == "title" else "Текст — до"
+                    raise ValueError(f"{prefix} {limits[key]} символов")
                 setattr(game, key, value)
 
     @classmethod
