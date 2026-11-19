@@ -121,13 +121,21 @@ tail -n 100 "$DATA_DIR/bot.stderr.log"
 
 ## 5. Резервная копия и обновление
 
-База содержит игры, анкеты и назначения. Делайте копию регулярно и обязательно перед обновлением. Скрипт использует резервное копирование SQLite, безопасное для работающей базы, и проверяет целостность результата:
+База содержит игры, анкеты и назначения. Делайте копию регулярно и обязательно перед обновлением. **Путь к файлу базы должен совпадать с `DATABASE_URL` в `.env`.** Проверьте только эту строку; токен показывать не нужно:
+
+```sh
+cd "$HOME/apps/secret-santa"
+grep '^DATABASE_URL=' .env
+```
+
+Если там `DATABASE_URL=sqlite:///santa.db` (значение, которое создаёт `scripts/init_env.py`), база находится в каталоге проекта: `"$APP_DIR/santa.db"`. Если там `sqlite:////Users/USER/santa-data/santa.db`, база находится по указанному абсолютному пути. Перед копированием можно проверить файл командой `ls -lh "$APP_DIR/santa.db"` или `ls -lh "$DATA_DIR/santa.db"` соответственно. Скрипт использует резервное копирование SQLite, безопасное для работающей базы, и проверяет целостность результата:
 
 ```sh
 APP_DIR="$HOME/apps/secret-santa"
 DATA_DIR="$HOME/santa-data"
 cd "$APP_DIR"
-.venv/bin/python scripts/backup_sqlite.py "$DATA_DIR/santa.db" "$DATA_DIR/backups/santa-$(date +%Y%m%d-%H%M%S).db"
+DB_PATH="$DATA_DIR/santa.db"  # Замените на "$APP_DIR/santa.db", если DATABASE_URL=sqlite:///santa.db
+.venv/bin/python scripts/backup_sqlite.py "$DB_PATH" "$DATA_DIR/backups/santa-$(date +%Y%m%d-%H%M%S).db"
 ```
 
 Периодически переносите копии на другой носитель или сервер: файл на том же Mac не защитит от потери диска. Сначала сохраните изменения на рабочем компьютере коммитом и отправьте их в `origin/main`. `git pull` на Mac получит только уже отправленные коммиты.
