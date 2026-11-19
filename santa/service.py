@@ -1,5 +1,6 @@
 import secrets
 from datetime import UTC, datetime, timedelta
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import create_engine, delete, func, inspect, or_, select, text
@@ -74,6 +75,21 @@ class Service:
             columns = {column["name"] for column in inspect(connection).get_columns("deliveries")}
             if "parse_mode" not in columns:
                 connection.execute(text("ALTER TABLE deliveries ADD COLUMN parse_mode VARCHAR(16) DEFAULT '' NOT NULL"))
+            if "claimed_at" not in columns:
+                connection.execute(text("ALTER TABLE deliveries ADD COLUMN claimed_at TIMESTAMP"))
+            for name, sql_type in (("media_type", "VARCHAR(12)"),
+                                   ("media_file_id", "VARCHAR(255)"),
+                                   ("button_text", "VARCHAR(64)"),
+                                   ("button_url", "VARCHAR(500)")):
+                if name not in columns:
+                    connection.execute(text(f"ALTER TABLE deliveries ADD COLUMN {name} {sql_type} DEFAULT '' NOT NULL"))
+            columns = {column["name"] for column in inspect(connection).get_columns("broadcasts")}
+            for name, sql_type in (("media_type", "VARCHAR(12)"),
+                                   ("media_file_id", "VARCHAR(255)"),
+                                   ("button_text", "VARCHAR(64)"),
+                                   ("button_url", "VARCHAR(500)")):
+                if name not in columns:
+                    connection.execute(text(f"ALTER TABLE broadcasts ADD COLUMN {name} {sql_type} DEFAULT '' NOT NULL"))
             columns = {column["name"] for column in inspect(connection).get_columns("questions")}
             if "reported" not in columns:
                 connection.execute(text("ALTER TABLE questions ADD COLUMN reported BOOLEAN DEFAULT FALSE NOT NULL"))
@@ -857,10 +873,22 @@ class Service:
                 "games": db.scalar(select(func.count()).select_from(Game)) or 0,
                 "active": db.scalar(select(func.count()).select_from(Game).where(
                     Game.status.in_(["registration", "drawn"]))) or 0,
+                "drawn": db.scalar(select(func.count()).select_from(Game).where(
+                    Game.status == "drawn")) or 0,
+                "finished": db.scalar(select(func.count()).select_from(Game).where(
+                    Game.status == "finished")) or 0,
+                "subscribers": db.scalar(select(func.count()).select_from(User).where(
+                    User.marketing_opt_in.is_(True))) or 0,
+                "blocked_users": db.scalar(select(func.count()).select_from(User).where(
+                    User.blocked.is_(True))) or 0,
+                "deliveries_sent": db.scalar(select(func.count()).select_from(Delivery).where(
+                    Delivery.state == "sent")) or 0,
                 "deliveries_pending": db.scalar(select(func.count()).select_from(Delivery).where(
                     Delivery.state == "pending")) or 0,
                 "deliveries_failed": db.scalar(select(func.count()).select_from(Delivery).where(
                     Delivery.state == "failed")) or 0,
+                "deliveries_sending": db.scalar(select(func.count()).select_from(Delivery).where(
+                    Delivery.state == "sending")) or 0,
             }
 
     @staticmethod
@@ -889,11 +917,29 @@ class Service:
         with self.sessions() as db:
             return len(self._broadcast_recipients(db, segment, utcnow()))
 
+    @staticmethod
+    def validate_broadcast(content: str, media_type: str = "", media_file_id: str = "",
+                           button_text: str = "", button_url: str = "") -> None:
+        max_length = 900 if media_type else 3000
+        if not 1 <= len(content.strip()) <= max_length:
+            raise ValueError(f"Текст должен быть от 1 до {max_length} символов")
+        if media_type not in {"", "photo", "video"} or bool(media_type) != bool(media_file_id):
+            raise ValueError("Поддерживаются фото и видео Telegram")
+        if len(media_file_id) > 255:
+            raise ValueError("Некорректный файл Telegram")
+        if bool(button_text) != bool(button_url):
+            raise ValueError("Для кнопки нужны название и ссылка")
+        if button_text and (len(button_text) > 64 or len(button_url) > 500 or
+                            urlparse(button_url).scheme not in {"http", "https"} or
+                            not urlparse(button_url).netloc):
+            raise ValueError("Кнопке нужна корректная ссылка HTTP(S)")
+
     def create_broadcast(self, owner_id: int, content: str, segment: str,
-                         due_at: datetime | None = None) -> tuple[int, int]:
+                         due_at: datetime | None = None, *, media_type: str = "",
+                         media_file_id: str = "", button_text: str = "",
+                         button_url: str = "") -> tuple[int, int]:
         content = content.strip()
-        if not 1 <= len(content) <= 3000:
-            raise ValueError("Текст должен быть от 1 до 3000 символов")
+        self.validate_broadcast(content, media_type, media_file_id, button_text, button_url)
         if not self.is_owner(owner_id):
             raise AccessDenied("Доступ закрыт")
         now = utcnow()
@@ -904,13 +950,17 @@ class Service:
             if not recipients:
                 raise ValueError("В выбранной аудитории нет подписчиков")
             campaign = Broadcast(owner_id=owner_id, text=content, segment=segment,
-                                 due_at=due_at or now)
+                                 due_at=due_at or now, media_type=media_type,
+                                 media_file_id=media_file_id, button_text=button_text,
+                                 button_url=button_url)
             db.add(campaign)
             db.flush()
             for recipient in recipients:
                 db.add(Delivery(key=f"broadcast:{campaign.id}:{recipient}", user_id=recipient,
                                 text=f"📬 Новости бота\n\n{content}\n\nОтключить новости: /start → Мои напоминания.",
-                                due_at=campaign.due_at))
+                                due_at=campaign.due_at, media_type=media_type,
+                                media_file_id=media_file_id, button_text=button_text,
+                                button_url=button_url))
             return campaign.id, len(recipients)
 
     def broadcasts(self, owner_id: int) -> list[Broadcast]:

@@ -6,6 +6,7 @@ from sqlalchemy import select
 from santa.draw import ImpossibleDraw, draw
 from santa.models import Assignment, Delivery, Mode, utcnow
 from santa.service import AccessDenied, InvalidState, Service
+from santa.worker import recover_stale
 
 
 @pytest.fixture
@@ -181,7 +182,7 @@ def test_questions_are_anonymous_and_answer_is_scoped(service):
     with service.sessions() as db:
         job = db.scalar(select(Delivery).where(Delivery.key == f"question:{question_id}"))
         assert job.user_id == receiver
-        assert str(giver) not in job.text
+        assert f"tg://user?id={giver}" not in job.text
     with pytest.raises(AccessDenied):
         service.answer_question(question_id, 99, "Синий")
     service.answer_question(question_id, receiver, "Синий")
@@ -492,6 +493,45 @@ def test_owner_broadcast_requires_consent_and_can_be_cancelled(service):
         assert all(job.state == "cancelled" for job in jobs)
 
 
+def test_broadcast_media_and_button_payload(service):
+    service.ensure_user(99, "Owner")
+    service.ensure_user(1, "Subscriber")
+    service.set_marketing(1, True)
+    with pytest.raises(ValueError):
+        service.create_broadcast(99, "Hello", "all", media_type="photo")
+    with pytest.raises(ValueError):
+        service.create_broadcast(99, "Hello", "all", button_text="Open",
+                                 button_url="javascript:alert(1)")
+    with pytest.raises(ValueError):
+        service.create_broadcast(99, "x" * 901, "all", media_type="photo",
+                                 media_file_id="telegram-photo")
+    campaign_id, count = service.create_broadcast(
+        99, "Hello", "all", media_type="photo", media_file_id="telegram-photo",
+        button_text="Open", button_url="https://example.com/path")
+    assert count == 1
+    with service.sessions() as db:
+        job = db.scalar(select(Delivery).where(Delivery.key == f"broadcast:{campaign_id}:1"))
+        assert job.media_type == "photo"
+        assert job.media_file_id == "telegram-photo"
+        assert job.button_text == "Open"
+        assert job.button_url == "https://example.com/path"
+
+
+def test_recover_stale_delivery_preserves_recent_claim(service):
+    service.ensure_user(1, "One")
+    with service.sessions.begin() as db:
+        db.add_all([
+            Delivery(key="old-claim", user_id=1, text="Old", state="sending",
+                     claimed_at=utcnow() - timedelta(minutes=6)),
+            Delivery(key="recent-claim", user_id=1, text="Recent", state="sending",
+                     claimed_at=utcnow()),
+        ])
+    assert recover_stale(service) == 1
+    with service.sessions() as db:
+        states = {job.key: job.state for job in db.scalars(select(Delivery))}
+    assert states == {"old-claim": "pending", "recent-claim": "sending"}
+
+
 def test_advent_setting_does_not_affect_draw(service):
     game = game_with_players(service)
     service.set_advent_enabled(game.id, 1, True)
@@ -516,4 +556,4 @@ def test_anonymous_questions_rate_limit_and_report_keep_sender_secret(service):
     assert reports == [(question_ids[0], "Question 0")]
     with service.sessions() as db:
         job = db.scalar(select(Delivery).where(Delivery.key == f"question-report:{question_ids[0]}"))
-        assert str(giver) not in job.text
+        assert f"tg://user?id={giver}" not in job.text

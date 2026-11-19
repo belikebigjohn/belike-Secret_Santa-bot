@@ -43,11 +43,13 @@ class Form(StatesGroup):
     edit_team = State()
     admin_date = State()
     admin_text = State()
+    admin_link = State()
 
 
 POSTER = Path(__file__).resolve().parent.parent / "assets" / "host_modes.png"
 WELCOME_ART = POSTER.with_name("welcome.png")
 MISSION_ART = POSTER.with_name("mission.png")
+ADVENT_ART = POSTER.with_name("advent.png")
 MODE_NAMES = {"blind": "🎁 Играю вслепую", "open": "🎩 Играю и всё знаю",
               "host": "👑 Только организатор"}
 MOSCOW = ZoneInfo("Europe/Moscow")
@@ -382,6 +384,7 @@ def create_router(service: Service, bot_username: str) -> Router:
                            f"Подарок: {display_date(data['gift_deadline'])}\n"
                            f"Вручение: {display_date(data['celebration_at'])}",
                            kb(("✅ Создать и открыть", "wizardcommit:publish"),
+                              ("⚙️ Дополнительные настройки", "wizardcommit:advanced"),
                               ("💾 Сохранить черновик", "wizardcommit:draft"),
                               ("⬅️ Изменить дату", "wizard:gift")))
         await state.set_state(None)
@@ -392,7 +395,8 @@ def create_router(service: Service, bot_username: str) -> Router:
         if not {"title", "mode", "budget", "registration_deadline", "gift_deadline", "celebration_at"} <= data.keys():
             await call.answer("Мастер устарел. Начните создание заново.", show_alert=True)
             return
-        draft = call.data.endswith(":draft")
+        advanced = call.data.endswith(":advanced")
+        draft = advanced or call.data.endswith(":draft")
         try:
             game_ = service.create_game(
                 call.from_user.id, call.from_user.full_name,
@@ -405,7 +409,12 @@ def create_router(service: Service, bot_username: str) -> Router:
             return
         await state.clear()
         await call.answer("Черновик сохранён" if draft else "Игра создана")
-        await show_game(call.message, game_.id, call.from_user.id)
+        if advanced:
+            await screen(call.message, "⚙️ Черновик создан. Настройте даты, состав и правила перед публикацией.",
+                         kb(("⚙️ Открыть настройки", f"settings:{game_.id}"),
+                            ("⬅️ К игре", f"game:{game_.id}")))
+        else:
+            await show_game(call.message, game_.id, call.from_user.id)
 
     @router.message(Form.registration_date)
     async def registration_date(message: Message, state: FSMContext):
@@ -681,6 +690,7 @@ def create_router(service: Service, bot_username: str) -> Router:
             ("🎄 Адвент", f"adventtoggle:{game_id}"),
             ("🤝 Помощники", f"helpers:{game_id}"),
             ("👑 Передать роль", f"transfer:{game_id}"),
+            *(("✅ Опубликовать игру", f"publish:{game_id}"),) if game_.status == "draft" else (),
             ("⬅️ К игре", f"game:{game_id}")))
 
     @router.callback_query(F.data.startswith("setmode:"))
@@ -1198,9 +1208,15 @@ def create_router(service: Service, bot_username: str) -> Router:
         stats = service.owner_stats(message.from_user.id)
         await screen(message, "🛠 <b>Сводка бота</b>\n\n"
                      f"Пользователей: {stats['users']}\n"
+                     f"Подписчиков новостей: {stats['subscribers']}\n"
+                     f"Заблокировали бота: {stats['blocked_users']}\n"
                      f"Игр: {stats['games']}\n"
                      f"Активных игр: {stats['active']}\n"
+                     f"После жеребьёвки: {stats['drawn']}\n"
+                     f"Завершённых: {stats['finished']}\n"
+                     f"Доставлено сообщений: {stats['deliveries_sent']}\n"
                      f"Сообщений в очереди: {stats['deliveries_pending']}\n"
+                     f"Отправляются: {stats['deliveries_sending']}\n"
                      f"Ошибок доставки: {stats['deliveries_failed']}",
                      kb(("📬 Новая рассылка", "adminbroadcast:new"),
                         ("📊 Рассылки", "adminbroadcast:list"),
@@ -1246,7 +1262,8 @@ def create_router(service: Service, bot_username: str) -> Router:
         await state.update_data(broadcast_due=None)
         await state.set_state(Form.admin_text)
         await call.answer()
-        panel = await screen(call.message, "📬 Напишите текст рассылки (до 3000 символов).")
+        panel = await screen(call.message, "📬 Отправьте текст (до 3000 символов) или фото/видео "
+                             "с подписью (до 900 символов).")
         await remember(state, panel)
 
     @router.callback_query(F.data == "adminbroadcast:later")
@@ -1271,24 +1288,87 @@ def create_router(service: Service, bot_username: str) -> Router:
             return
         await state.update_data(broadcast_due=due)
         await state.set_state(Form.admin_text)
-        await update_panel(message, state, "📬 Напишите текст рассылки (до 3000 символов).")
+        await update_panel(message, state, "📬 Отправьте текст (до 3000 символов) или фото/видео "
+                           "с подписью (до 900 символов).")
 
     @router.message(Form.admin_text)
     async def admin_text(message: Message, state: FSMContext):
-        data = await state.get_data()
-        content = (message.text or "").strip()
-        if not service.is_owner(message.from_user.id) or not 1 <= len(content) <= 3000:
-            await update_panel(message, state, "Текст должен быть от 1 до 3000 символов.")
+        content = (message.caption or message.text or "").strip()
+        media_type = "photo" if message.photo else "video" if message.video else ""
+        media_file_id = (message.photo[-1].file_id if message.photo else
+                         message.video.file_id if message.video else "")
+        try:
+            if not service.is_owner(message.from_user.id):
+                raise AccessDenied("Нет доступа")
+            service.validate_broadcast(content, media_type, media_file_id)
+        except ValueError as exc:
+            await update_panel(message, state, escape(str(exc)))
             return
-        await state.update_data(broadcast_text=content)
+        await state.update_data(broadcast_text=content, broadcast_media_type=media_type,
+                                broadcast_media_file_id=media_file_id)
+        await state.set_state(Form.admin_link)
+        await update_panel(message, state, "🔗 Если нужна кнопка, отправьте строку вида "
+                           "<code>Открыть сайт | https://example.com</code>. "
+                           "Без кнопки отправьте <code>-</code>.")
+
+    @router.message(Form.admin_link)
+    async def admin_link(message: Message, state: FSMContext):
+        data = await state.get_data()
+        raw = (message.text or "").strip()
+        if not service.is_owner(message.from_user.id):
+            await update_panel(message, state, "Нет доступа")
+            return
+        if raw == "-":
+            button_text, button_url = "", ""
+        elif "|" in raw:
+            button_text, button_url = [part.strip() for part in raw.split("|", 1)]
+        else:
+            await update_panel(message, state, "Введите название | https://ссылка или -.")
+            return
+        try:
+            service.validate_broadcast(data["broadcast_text"],
+                                       data.get("broadcast_media_type", ""),
+                                       data.get("broadcast_media_file_id", ""),
+                                       button_text, button_url)
+        except ValueError as exc:
+            await update_panel(message, state, escape(str(exc)))
+            return
+        await state.update_data(broadcast_button_text=button_text,
+                                broadcast_button_url=button_url)
         count = service.broadcast_audience_count(message.from_user.id, data["broadcast_segment"])
+        media_note = (f"\nМедиа: {data['broadcast_media_type']}" if
+                      data.get("broadcast_media_type") else "")
+        button_note = (f"\nКнопка: {escape(button_text)} → {escape(button_url)}" if button_text else "")
         await update_panel(message, state,
                            f"📬 <b>Предпросмотр для {count} подписчиков</b>\n\n"
-                           f"{limited_html(content, 3000)}\n\n"
-                           f"Отправка: {display_date(data.get('broadcast_due')) if data.get('broadcast_due') else 'сейчас'}",
-                           kb(("✅ Подтвердить рассылку", "adminbroadcast:confirm"),
+                           f"{limited_html(data['broadcast_text'], 3000)}\n\n"
+                           f"Отправка: {display_date(data.get('broadcast_due')) if data.get('broadcast_due') else 'сейчас'}"
+                           f"{media_note}{button_note}",
+                           kb(("🧪 Отправить себе", "adminbroadcast:test"),
+                              ("✅ Подтвердить рассылку", "adminbroadcast:confirm"),
                               ("⬅️ Отмена", "home")))
         await state.set_state(None)
+
+    @router.callback_query(F.data == "adminbroadcast:test")
+    async def admin_broadcast_test(call: CallbackQuery, state: FSMContext):
+        data = await state.get_data()
+        if not service.is_owner(call.from_user.id) or not data.get("broadcast_text"):
+            await call.answer("Предпросмотр устарел", show_alert=True)
+            return
+        markup = (InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+            text=data["broadcast_button_text"], url=data["broadcast_button_url"])]])
+            if data.get("broadcast_button_text") else None)
+        caption = "🧪 Тест рассылки\n\n" + data["broadcast_text"]
+        media_type = data.get("broadcast_media_type")
+        if media_type == "photo":
+            await call.bot.send_photo(call.from_user.id, data["broadcast_media_file_id"],
+                                      caption=caption, reply_markup=markup)
+        elif media_type == "video":
+            await call.bot.send_video(call.from_user.id, data["broadcast_media_file_id"],
+                                      caption=caption, reply_markup=markup)
+        else:
+            await call.bot.send_message(call.from_user.id, caption, reply_markup=markup)
+        await call.answer("Тест отправлен вам")
 
     @router.callback_query(F.data == "adminbroadcast:confirm")
     async def admin_broadcast_confirm(call: CallbackQuery, state: FSMContext):
@@ -1299,7 +1379,10 @@ def create_router(service: Service, bot_username: str) -> Router:
         try:
             campaign_id, count = service.create_broadcast(
                 call.from_user.id, data["broadcast_text"], data["broadcast_segment"],
-                data.get("broadcast_due"))
+                data.get("broadcast_due"), media_type=data.get("broadcast_media_type", ""),
+                media_file_id=data.get("broadcast_media_file_id", ""),
+                button_text=data.get("broadcast_button_text", ""),
+                button_url=data.get("broadcast_button_url", ""))
         except ValueError as exc:
             await call.answer(str(exc), show_alert=True)
             return
@@ -1690,7 +1773,7 @@ def create_router(service: Service, bot_username: str) -> Router:
             return
         await call.answer()
         await screen(call.message, "📮 <b>Карточка дня</b>\n\n" + escape(advent_card(game_id)),
-                     kb(("⬅️ К настроению", f"mood:{game_id}")))
+                     kb(("⬅️ К настроению", f"mood:{game_id}")), art=ADVENT_ART)
 
     @router.callback_query(F.data.startswith("prediction:"))
     async def prediction(call: CallbackQuery):
