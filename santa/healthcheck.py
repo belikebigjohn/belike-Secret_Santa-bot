@@ -7,6 +7,8 @@ from pathlib import Path
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 
+from santa.config import local_env
+
 
 def healthy(database_url: str, worker_file: str = "", max_age_seconds: int = 45) -> bool:
     if worker_file:
@@ -30,7 +32,7 @@ def healthy(database_url: str, worker_file: str = "", max_age_seconds: int = 45)
 
 
 def main() -> None:
-    database_url = os.environ.get("DATABASE_URL", "")
+    database_url = os.environ.get("DATABASE_URL") or local_env().get("DATABASE_URL", "")
     if not database_url or not healthy(database_url, os.environ.get("WORKER_HEALTH_FILE", "")):
         raise SystemExit(1)
 
