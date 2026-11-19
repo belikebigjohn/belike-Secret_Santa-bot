@@ -68,13 +68,8 @@ def visible_length(markup: str) -> int:
     return len(plain.encode("utf-16-le")) // 2
 
 
-def game_card_text(game: Game, total: int | None, bot_username: str) -> tuple[str, bool]:
+def game_card_text(game: Game, total: int | None, bot_username: str) -> str:
     lines = [f"🎄 <b>{escape(game.title)}</b>", f"<i>{MODE_NAMES[game.mode]}</i>"]
-    text_sections = []
-    if game.description:
-        text_sections.extend(["", "📝 <b>Описание:</b>", expandable_quote(game.description)])
-    if game.rules:
-        text_sections.extend(["", "📜 <b>Правила:</b>", expandable_quote(game.rules)])
     lines.extend(["", f"💰 <b>Бюджет:</b> {escape(game.budget)}",
                   f"🎲 <b>Статус:</b> { {'draft': 'черновик', 'registration': 'регистрация', 'drawn': 'жеребьёвка проведена', 'finished': 'завершена', 'archived': 'архив'}[game.status] }"])
     if total is not None:
@@ -85,20 +80,13 @@ def game_card_text(game: Game, total: int | None, bot_username: str) -> tuple[st
     for label, value in (("Регистрация", game.registration_deadline),
                          ("Подарок", game.gift_deadline), ("Вручение", game.celebration_at)):
         lines.append(f"{label} — {display_date(value)}")
-    separate_text = visible_length("\n".join(lines[:2] + text_sections + lines[2:])) > CAPTION_BUDGET
-    if separate_text:
-        for preview_length in (140, 70, 0):
-            text_sections = []
-            for label, value in (("📝 <b>Описание:</b>", game.description),
-                                 ("📜 <b>Правила:</b>", game.rules)):
-                if value:
-                    text_sections.extend(["", label])
-                    if preview_length:
-                        text_sections.append(expandable_quote(
-                            value[:preview_length] + ("…" if len(value) > preview_length else "")))
-            if visible_length("\n".join(lines[:2] + text_sections + lines[2:])) <= CAPTION_BUDGET:
-                break
-    return "\n".join(lines[:2] + text_sections + lines[2:]), separate_text
+    return "\n".join(lines)
+
+
+def game_detail_text(game: Game, field: str) -> str:
+    label = "Описание" if field == "description" else "Правила"
+    return (f"<b>{label} игры «{escape(game.title)}»</b>\n\n"
+            + expandable_quote(getattr(game, field) or "Не указано"))
 
 
 def local_date(value: str) -> datetime:
@@ -236,13 +224,12 @@ def create_router(service: Service, bot_username: str) -> Router:
             return
         game, member, total = view
         helper = service.is_helper(game_id, viewer_id)
-        caption, separate_text = game_card_text(game, total, bot_username)
+        caption = game_card_text(game, total, bot_username)
         buttons = []
-        if separate_text:
-            if game.description:
-                buttons.append(("📝 Описание полностью", f"gametext:{game_id}:description"))
-            if game.rules:
-                buttons.append(("📜 Правила полностью", f"gametext:{game_id}:rules"))
+        if game.description:
+            buttons.append(("📝 Описание", f"gametext:{game_id}:description"))
+        if game.rules:
+            buttons.append(("📜 Правила", f"gametext:{game_id}:rules"))
         if member:
             buttons.extend([("📝 Анкета", f"profile:{game_id}"), ("🎅 Моя миссия", f"mission:{game_id}")])
             if game.status == "drawn":
@@ -283,10 +270,8 @@ def create_router(service: Service, bot_username: str) -> Router:
             await call.answer("Нет доступа", show_alert=True)
             return
         game_, _, _ = view
-        label = "Описание" if field == "description" else "Правила"
         await call.answer()
-        await screen(call.message, f"<b>{label} игры «{escape(game_.title)}»</b>\n\n"
-                     + expandable_quote(getattr(game_, field) or "Не указаны"),
+        await screen(call.message, game_detail_text(game_, field),
                      kb(("⬅️ К игре", f"game:{game_id}")))
 
     async def show_invite(message: Message, token: str):
@@ -295,24 +280,13 @@ def create_router(service: Service, bot_username: str) -> Router:
             await screen(message, "Приглашение больше не действует.",
                          kb(("⬅️ Главное меню", "home")))
             return
-        description = game_.description or "не указано"
-        rules = game_.rules or "не указаны"
-        for preview_length in (None, 300, 120, 0):
-            shown_description = description if preview_length is None else description[:preview_length]
-            shown_rules = rules if preview_length is None else rules[:preview_length]
-            invitation = (f"🎄 <b>{limited_html(game_.title, 300)}</b>\n"
-                          f"📝 <b>Описание:</b>\n"
-                          f"{expandable_quote(shown_description + ('…' if len(description) > len(shown_description) else '')) if shown_description else ''}\n"
-                          f"Бюджет: {limited_html(game_.budget, 250)}\n"
-                          f"📜 <b>Правила:</b>\n"
-                          f"{expandable_quote(shown_rules + ('…' if len(rules) > len(shown_rules) else '')) if shown_rules else ''}")
-            if visible_length(invitation) <= CAPTION_BUDGET:
-                break
+        invitation = (f"🎄 <b>{limited_html(game_.title, 300)}</b>\n\n"
+                      f"💰 <b>Бюджет:</b> {limited_html(game_.budget, 250)}")
         buttons = []
-        if len(shown_description) < len(description):
-            buttons.append(("📝 Описание полностью", f"invitetext:{token}:description"))
-        if len(shown_rules) < len(rules):
-            buttons.append(("📜 Правила полностью", f"invitetext:{token}:rules"))
+        if game_.description:
+            buttons.append(("📝 Описание", f"invitetext:{token}:description"))
+        if game_.rules:
+            buttons.append(("📜 Правила", f"invitetext:{token}:rules"))
         buttons.extend([("Участвовать", f"join:{game_.id}"),
                         ("⬅️ Главное меню", "home")])
         await screen(message, invitation, kb(*buttons), art=game_.cover_file_id or WELCOME_ART)
@@ -324,10 +298,8 @@ def create_router(service: Service, bot_username: str) -> Router:
         if game_ is None or field not in {"description", "rules"}:
             await call.answer("Приглашение недоступно", show_alert=True)
             return
-        label = "Описание" if field == "description" else "Правила"
         await call.answer()
-        await screen(call.message, f"<b>{label} игры «{escape(game_.title)}»</b>\n\n"
-                     + expandable_quote(getattr(game_, field) or "Не указаны"),
+        await screen(call.message, game_detail_text(game_, field),
                      kb(("Участвовать", f"join:{game_.id}"),
                         ("⬅️ К приглашению", f"inviteback:{token}")))
 

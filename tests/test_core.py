@@ -4,7 +4,7 @@ from datetime import timedelta
 import pytest
 from sqlalchemy import select
 
-from santa.bot import CAPTION_BUDGET, game_card_text, visible_length
+from santa.bot import CAPTION_BUDGET, game_card_text, game_detail_text, visible_length
 from santa.draw import ImpossibleDraw, draw
 from santa.models import Assignment, Delivery, Member, Mode, User, utcnow
 from santa.service import AccessDenied, InvalidState, Service
@@ -99,12 +99,20 @@ def test_profile_text_limit_is_500_characters(service):
 
 
 def test_long_game_text_keeps_cover_caption_within_limit(service):
-    game = service.create_game(1, "Host", "Ёлка", Mode.BLIND)
+    game = service.create_game(1, "Host", "<" * 120, Mode.BLIND, budget="&" * 80)
     service.edit_game(game.id, 1, description="О" * 2000, rules="П" * 3000)
-    caption, has_full_text_buttons = game_card_text(service.game(game.id), 80, "santa_bot")
-    assert has_full_text_buttons
+    saved = service.game(game.id)
+    caption = game_card_text(saved, 80, "santa_bot")
     assert visible_length(caption) <= CAPTION_BUDGET
-    assert "<blockquote expandable>" in caption
+    assert "<blockquote" not in caption
+    assert "О" * 50 not in caption and "П" * 50 not in caption
+    assert "<blockquote expandable>" + "О" * 2000 + "</blockquote>" in game_detail_text(
+        saved, "description"
+    )
+    assert "<blockquote expandable>" + "П" * 3000 + "</blockquote>" in game_detail_text(
+        saved, "rules"
+    )
+    assert "…" not in game_detail_text(saved, "rules")
 
 
 def test_description_and_rules_accept_documented_limits(service):
