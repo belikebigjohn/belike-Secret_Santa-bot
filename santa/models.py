@@ -35,6 +35,7 @@ class User(Base):
     marketing_opt_in: Mapped[bool] = mapped_column(Boolean, default=False)
     reminders_opt_in: Mapped[bool] = mapped_column(Boolean, default=True)
     blocked: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class ReminderPreference(Base):
@@ -65,6 +66,7 @@ class Game(Base):
     max_members: Mapped[int | None] = mapped_column(Integer, nullable=True)
     approval_required: Mapped[bool] = mapped_column(Boolean, default=False)
     team_policy: Mapped[str] = mapped_column(String(12), default="mixed")
+    advent_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     status: Mapped[str] = mapped_column(String(20), default="registration")
     reminders_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
@@ -113,7 +115,17 @@ class Question(Base):
     receiver_id: Mapped[int] = mapped_column(BigInteger)
     text: Mapped[str] = mapped_column(Text)
     answer: Mapped[str] = mapped_column(Text, default="")
+    reported: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class QuestionMute(Base):
+    __tablename__ = "question_mutes"
+    __table_args__ = (UniqueConstraint("game_id", "giver_id", "receiver_id"),)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    game_id: Mapped[int] = mapped_column(ForeignKey("games.id", ondelete="CASCADE"), index=True)
+    giver_id: Mapped[int] = mapped_column(BigInteger)
+    receiver_id: Mapped[int] = mapped_column(BigInteger)
 
 
 class Exclusion(Base):
@@ -149,3 +161,14 @@ class Delivery(Base):
     state: Mapped[str] = mapped_column(String(20), default="pending")
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     last_error: Mapped[str] = mapped_column(String(160), default="")
+
+
+class Broadcast(Base):
+    __tablename__ = "broadcasts"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    owner_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.id"))
+    text: Mapped[str] = mapped_column(Text)
+    segment: Mapped[str] = mapped_column(String(20))
+    due_at: Mapped[datetime] = mapped_column(DateTime)
+    state: Mapped[str] = mapped_column(String(20), default="queued")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)

@@ -10,6 +10,7 @@ from santa.formatting import limited_html, profile_link
 from santa.models import (
     Assignment,
     Base,
+    Broadcast,
     Delivery,
     Exclusion,
     Game,
@@ -17,6 +18,7 @@ from santa.models import (
     Member,
     Mode,
     Question,
+    QuestionMute,
     ReminderPreference,
     ReplacementInvite,
     User,
@@ -44,6 +46,9 @@ class Service:
         Base.metadata.create_all(self.engine)
         # Upgrade databases created by earlier releases without dropping game data.
         with self.engine.begin() as connection:
+            user_columns = {column["name"] for column in inspect(connection).get_columns("users")}
+            if "created_at" not in user_columns:
+                connection.execute(text("ALTER TABLE users ADD COLUMN created_at TIMESTAMP"))
             columns = {column["name"] for column in inspect(connection).get_columns("games")}
             for name, sql_type in (("rules", "TEXT"), ("cover_file_id", "VARCHAR(255)")):
                 if name not in columns:
@@ -57,6 +62,8 @@ class Service:
                 connection.execute(text("ALTER TABLE games ADD COLUMN approval_required BOOLEAN DEFAULT FALSE NOT NULL"))
             if "team_policy" not in columns:
                 connection.execute(text("ALTER TABLE games ADD COLUMN team_policy VARCHAR(12) DEFAULT 'mixed' NOT NULL"))
+            if "advent_enabled" not in columns:
+                connection.execute(text("ALTER TABLE games ADD COLUMN advent_enabled BOOLEAN DEFAULT FALSE NOT NULL"))
             columns = {column["name"] for column in inspect(connection).get_columns("members")}
             if "received" not in columns:
                 connection.execute(text("ALTER TABLE members ADD COLUMN received BOOLEAN DEFAULT FALSE NOT NULL"))
@@ -67,6 +74,9 @@ class Service:
             columns = {column["name"] for column in inspect(connection).get_columns("deliveries")}
             if "parse_mode" not in columns:
                 connection.execute(text("ALTER TABLE deliveries ADD COLUMN parse_mode VARCHAR(16) DEFAULT '' NOT NULL"))
+            columns = {column["name"] for column in inspect(connection).get_columns("questions")}
+            if "reported" not in columns:
+                connection.execute(text("ALTER TABLE questions ADD COLUMN reported BOOLEAN DEFAULT FALSE NOT NULL"))
 
     def ensure_user(self, user_id: int, name: str) -> None:
         with self.sessions.begin() as db:
@@ -342,6 +352,14 @@ class Service:
                 raise InvalidState("После жеребьёвки настройку менять нельзя")
             game.team_policy = policy
 
+    def set_advent_enabled(self, game_id: int, host_id: int, enabled: bool) -> None:
+        with self.sessions.begin() as db:
+            game = self._game(db, game_id, lock=True)
+            self._require_host(game, host_id)
+            if game.status not in {"draft", "registration", "drawn"}:
+                raise InvalidState("Игра уже завершена")
+            game.advent_enabled = enabled
+
     def set_member_team(self, game_id: int, host_id: int, user_id: int, team: str) -> None:
         if len(team.strip()) > 80:
             raise ValueError("Название команды слишком длинное")
@@ -408,9 +426,11 @@ class Service:
                                 ("draw", "announcement", "reminder", "daily", "review", "replacement")]
             for question_id in question_ids:
                 delivery_filters.extend((Delivery.key == f"question:{question_id}",
-                                         Delivery.key == f"answer:{question_id}"))
+                                         Delivery.key == f"answer:{question_id}",
+                                         Delivery.key == f"question-report:{question_id}"))
             db.execute(delete(Delivery).where(or_(*delivery_filters)))
-            for model in (Question, Assignment, Exclusion, GameHelper, ReplacementInvite, Member):
+            for model in (Question, QuestionMute, Assignment, Exclusion, GameHelper,
+                          ReplacementInvite, Member):
                 db.execute(delete(model).where(model.game_id == game_id))
             db.delete(game)
 
@@ -494,10 +514,13 @@ class Service:
                 (Question.giver_id == leaver.user_id) | (Question.receiver_id == leaver.user_id))))
             for question in questions:
                 db.execute(delete(Delivery).where(Delivery.key.in_((f"question:{question.id}",
-                                                                     f"answer:{question.id}"))))
+                                                                     f"answer:{question.id}",
+                                                                     f"question-report:{question.id}"))))
                 db.delete(question)
             db.execute(delete(Exclusion).where(Exclusion.game_id == game.id,
                 (Exclusion.giver_id == leaver.user_id) | (Exclusion.receiver_id == leaver.user_id)))
+            db.execute(delete(QuestionMute).where(QuestionMute.game_id == game.id,
+                (QuestionMute.giver_id == leaver.user_id) | (QuestionMute.receiver_id == leaver.user_id)))
             db.execute(delete(GameHelper).where(GameHelper.game_id == game.id,
                                                  GameHelper.user_id == leaver.user_id))
             for job in db.scalars(select(Delivery).where(Delivery.user_id == leaver.user_id,
@@ -537,6 +560,10 @@ class Service:
             if user is None:
                 raise AccessDenied("Сначала откройте /start")
             user.marketing_opt_in = enabled
+            if not enabled:
+                for job in db.scalars(select(Delivery).where(Delivery.user_id == user_id,
+                    Delivery.state == "pending", Delivery.key.like("broadcast:%"))):
+                    job.state = "cancelled"
 
     def marketing_enabled(self, user_id: int) -> bool:
         with self.sessions() as db:
@@ -555,6 +582,15 @@ class Service:
                                                             Assignment.giver_id == giver_id))
             if assignment is None:
                 raise AccessDenied("Нет назначения в этой игре")
+            if db.scalar(select(QuestionMute.id).where(QuestionMute.game_id == game_id,
+                                                        QuestionMute.giver_id == giver_id,
+                                                        QuestionMute.receiver_id == assignment.receiver_id)):
+                raise InvalidState("Получатель закрыл анонимный диалог")
+            recent = db.scalar(select(func.count()).select_from(Question).where(
+                Question.game_id == game_id, Question.giver_id == giver_id,
+                Question.created_at >= utcnow() - timedelta(hours=1))) or 0
+            if recent >= 3:
+                raise InvalidState("Можно отправить не более трёх вопросов в час")
             item = Question(game_id=game_id, giver_id=giver_id,
                             receiver_id=assignment.receiver_id, text=question)
             db.add(item)
@@ -582,6 +618,29 @@ class Service:
             game = self._game(db, item.game_id)
             db.add(Delivery(key=f"answer:{item.id}", user_id=item.giver_id,
                             text=f"🎭 Ответ получателя в игре «{game.title}»:\n{answer}"))
+
+    def stop_questions(self, question_id: int, receiver_id: int, report: bool = False) -> None:
+        with self.sessions.begin() as db:
+            question = db.get(Question, question_id)
+            if question is None or question.receiver_id != receiver_id:
+                raise AccessDenied("Вопрос не найден")
+            if not db.scalar(select(QuestionMute.id).where(QuestionMute.game_id == question.game_id,
+                QuestionMute.giver_id == question.giver_id,
+                QuestionMute.receiver_id == receiver_id)):
+                db.add(QuestionMute(game_id=question.game_id, giver_id=question.giver_id,
+                                    receiver_id=receiver_id))
+            if report and not question.reported:
+                question.reported = True
+                game = self._game(db, question.game_id)
+                db.add(Delivery(key=f"question-report:{question.id}", user_id=game.host_id,
+                                text=f"⚠️ Жалоба на анонимный вопрос #{question.id} "
+                                     f"в игре «{game.title}». Откройте игру → Жалобы."))
+
+    def reported_questions(self, game_id: int, host_id: int) -> list[tuple[int, str]]:
+        with self.sessions() as db:
+            self._require_host(self._game(db, game_id), host_id)
+            return list(db.execute(select(Question.id, Question.text).where(
+                Question.game_id == game_id, Question.reported.is_(True)).order_by(Question.id)).all())
 
     def confirm_received(self, game_id: int, user_id: int) -> None:
         with self.sessions.begin() as db:
@@ -800,7 +859,96 @@ class Service:
                     Game.status.in_(["registration", "drawn"]))) or 0,
                 "deliveries_pending": db.scalar(select(func.count()).select_from(Delivery).where(
                     Delivery.state == "pending")) or 0,
+                "deliveries_failed": db.scalar(select(func.count()).select_from(Delivery).where(
+                    Delivery.state == "failed")) or 0,
             }
+
+    @staticmethod
+    def _broadcast_recipients(db: Session, segment: str, now: datetime) -> list[int]:
+        if segment not in {"all", "recent", "hosts", "active", "finished"}:
+            raise ValueError("Неизвестная аудитория")
+        users = list(db.scalars(select(User).where(User.marketing_opt_in.is_(True),
+                                                  User.blocked.is_(False))))
+        if segment == "all":
+            return [user.id for user in users]
+        if segment == "recent":
+            return [user.id for user in users if user.created_at and
+                    user.created_at >= now - timedelta(days=30)]
+        if segment == "hosts":
+            selected = set(db.scalars(select(Game.host_id)))
+        else:
+            status = ["registration", "drawn"] if segment == "active" else ["finished"]
+            selected = set(db.scalars(select(Member.user_id).join(Game, Game.id == Member.game_id)
+                                      .where(Game.status.in_(status))))
+            selected.update(db.scalars(select(Game.host_id).where(Game.status.in_(status))))
+        return [user.id for user in users if user.id in selected]
+
+    def broadcast_audience_count(self, owner_id: int, segment: str) -> int:
+        if not self.is_owner(owner_id):
+            raise AccessDenied("Доступ закрыт")
+        with self.sessions() as db:
+            return len(self._broadcast_recipients(db, segment, utcnow()))
+
+    def create_broadcast(self, owner_id: int, content: str, segment: str,
+                         due_at: datetime | None = None) -> tuple[int, int]:
+        content = content.strip()
+        if not 1 <= len(content) <= 3000:
+            raise ValueError("Текст должен быть от 1 до 3000 символов")
+        if not self.is_owner(owner_id):
+            raise AccessDenied("Доступ закрыт")
+        now = utcnow()
+        if due_at is not None and due_at <= now:
+            raise ValueError("Дата отправки должна быть в будущем")
+        with self.sessions.begin() as db:
+            recipients = self._broadcast_recipients(db, segment, now)
+            if not recipients:
+                raise ValueError("В выбранной аудитории нет подписчиков")
+            campaign = Broadcast(owner_id=owner_id, text=content, segment=segment,
+                                 due_at=due_at or now)
+            db.add(campaign)
+            db.flush()
+            for recipient in recipients:
+                db.add(Delivery(key=f"broadcast:{campaign.id}:{recipient}", user_id=recipient,
+                                text=f"📬 Новости бота\n\n{content}\n\nОтключить новости: /start → Мои напоминания.",
+                                due_at=campaign.due_at))
+            return campaign.id, len(recipients)
+
+    def broadcasts(self, owner_id: int) -> list[Broadcast]:
+        if not self.is_owner(owner_id):
+            raise AccessDenied("Доступ закрыт")
+        with self.sessions() as db:
+            return list(db.scalars(select(Broadcast).order_by(Broadcast.id.desc()).limit(10)))
+
+    def broadcast_stats(self, owner_id: int, broadcast_id: int) -> dict[str, int | str]:
+        if not self.is_owner(owner_id):
+            raise AccessDenied("Доступ закрыт")
+        with self.sessions() as db:
+            campaign = db.get(Broadcast, broadcast_id)
+            if campaign is None:
+                raise ValueError("Рассылка не найдена")
+            jobs = list(db.scalars(select(Delivery.state).where(
+                Delivery.key.like(f"broadcast:{broadcast_id}:%"))))
+            return {"state": campaign.state, "total": len(jobs),
+                    "sent": jobs.count("sent"), "failed": jobs.count("failed"),
+                    "pending": jobs.count("pending"), "cancelled": jobs.count("cancelled")}
+
+    def cancel_broadcast(self, owner_id: int, broadcast_id: int) -> int:
+        if not self.is_owner(owner_id):
+            raise AccessDenied("Доступ закрыт")
+        with self.sessions.begin() as db:
+            campaign = db.get(Broadcast, broadcast_id)
+            if campaign is None:
+                raise ValueError("Рассылка не найдена")
+            if campaign.state == "cancelled":
+                return 0
+            cancelled = 0
+            for job in db.scalars(select(Delivery).where(
+                    Delivery.key.like(f"broadcast:{broadcast_id}:%"),
+                    Delivery.state == "pending")):
+                job.state = "cancelled"
+                cancelled += 1
+            campaign.state = "cancelled"
+            return cancelled
 
     @staticmethod
     def _game(db: Session, game_id: int, lock: bool = False) -> Game:

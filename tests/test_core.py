@@ -464,3 +464,56 @@ def test_draft_copy_and_publish(service):
     service.publish_game(clone.id, 1)
     assert service.game_by_token(clone.token).id == clone.id
     service.join(clone.id, 2, "Two")
+
+
+def test_owner_broadcast_requires_consent_and_can_be_cancelled(service):
+    service.ensure_user(99, "Owner")
+    game = service.create_game(1, "Host", "Holiday", Mode.HOST)
+    for user_id in (2, 3):
+        service.join(game.id, user_id, str(user_id))
+    service.set_marketing(1, True)
+    service.set_marketing(2, True)
+    assert service.broadcast_audience_count(99, "all") == 2
+    assert service.broadcast_audience_count(99, "hosts") == 1
+    assert service.broadcast_audience_count(99, "active") == 2
+    with pytest.raises(AccessDenied):
+        service.create_broadcast(1, "Unauthorized", "all")
+    campaign_id, count = service.create_broadcast(
+        99, "News", "all", due_at=utcnow() + timedelta(days=2))
+    assert count == 2
+    assert service.broadcast_stats(99, campaign_id)["pending"] == 2
+    service.set_marketing(2, False)
+    assert service.broadcast_stats(99, campaign_id)["cancelled"] == 1
+    assert service.cancel_broadcast(99, campaign_id) == 1
+    assert service.broadcast_stats(99, campaign_id)["pending"] == 0
+    with service.sessions() as db:
+        jobs = db.scalars(select(Delivery).where(Delivery.key.like(f"broadcast:{campaign_id}:%"))).all()
+        assert {job.user_id for job in jobs} == {1, 2}
+        assert all(job.state == "cancelled" for job in jobs)
+
+
+def test_advent_setting_does_not_affect_draw(service):
+    game = game_with_players(service)
+    service.set_advent_enabled(game.id, 1, True)
+    assert service.game(game.id).advent_enabled
+    assert len(service.run_draw(game.id, 1)) == 4
+
+
+def test_anonymous_questions_rate_limit_and_report_keep_sender_secret(service):
+    game = game_with_players(service)
+    assignments = service.run_draw(game.id, 1)
+    giver, receiver = next(iter(assignments.items()))
+    question_ids = [service.ask_receiver(game.id, giver, f"Question {index}")
+                    for index in range(3)]
+    with pytest.raises(InvalidState):
+        service.ask_receiver(game.id, giver, "Fourth")
+    service.stop_questions(question_ids[0], receiver, report=True)
+    with pytest.raises(InvalidState):
+        service.ask_receiver(game.id, giver, "After mute")
+    with pytest.raises(AccessDenied):
+        service.stop_questions(question_ids[0], 99, report=True)
+    reports = service.reported_questions(game.id, 1)
+    assert reports == [(question_ids[0], "Question 0")]
+    with service.sessions() as db:
+        job = db.scalar(select(Delivery).where(Delivery.key == f"question-report:{question_ids[0]}"))
+        assert str(giver) not in job.text
