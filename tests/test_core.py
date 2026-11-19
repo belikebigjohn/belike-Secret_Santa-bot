@@ -322,3 +322,145 @@ def test_draw_notification_stays_within_telegram_limit(service):
         jobs = db.scalars(select(Delivery).where(Delivery.key.like(f"draw:{game.id}:%"))).all()
         assert len(jobs) == 2
         assert all(len(job.text) <= 4096 for job in jobs)
+
+
+def test_capacity_and_approval_gate_draw(service):
+    game = service.create_game(1, "Host", "Team", Mode.HOST,
+                               max_members=2, approval_required=True)
+    first = service.join(game.id, 2, "Two")
+    second = service.join(game.id, 3, "Three")
+    assert not first.approved and not second.approved
+    with pytest.raises(InvalidState):
+        service.join(game.id, 4, "Four")
+    with pytest.raises(InvalidState):
+        service.run_draw(game.id, 1)
+    service.review_member(game.id, 1, 2, True)
+    service.review_member(game.id, 1, 3, True)
+    assert len(service.run_draw(game.id, 1)) == 2
+
+
+def test_team_policy_limits_assignments(service):
+    game = service.create_game(1, "Host", "Branches", Mode.HOST, team_policy="within")
+    for user_id in range(2, 6):
+        service.join(game.id, user_id, str(user_id))
+    with pytest.raises(InvalidState):
+        service.run_draw(game.id, 1)
+    for user_id in range(2, 6):
+        service.set_member_team(game.id, 1, user_id, "North" if user_id < 4 else "South")
+    result = service.run_draw(game.id, 1)
+    assert {2, 3} == {result[2], result[3]}
+    assert {4, 5} == {result[4], result[5]}
+
+
+def test_registration_dates_and_capacity_edits(service):
+    now = utcnow()
+    game = service.create_game(1, "Host", "Dates", Mode.BLIND)
+    service.set_game_date(game.id, 1, "registration_start", now + timedelta(days=1))
+    with pytest.raises(InvalidState):
+        service.join(game.id, 2, "Two")
+    service.set_game_date(game.id, 1, "registration_start", None)
+    service.set_game_date(game.id, 1, "registration_deadline", now + timedelta(days=2))
+    with pytest.raises(ValueError):
+        service.set_game_date(game.id, 1, "draw_at", now + timedelta(days=1))
+    service.set_max_members(game.id, 1, 2)
+    service.join(game.id, 2, "Two")
+    with pytest.raises(InvalidState):
+        service.join(game.id, 3, "Three")
+    with pytest.raises(ValueError):
+        service.set_max_members(game.id, 1, 1)
+
+
+def test_segmented_announcements_only_reach_intended_members(service):
+    game = service.create_game(1, "Host", "Teams", Mode.HOST)
+    for user_id in (2, 3, 4, 5):
+        service.join(game.id, user_id, str(user_id))
+        service.set_member_team(game.id, 1, user_id, "North" if user_id < 4 else "South")
+    assert service.teams(game.id, 1) == ["North", "South"]
+    assert service.announce(game.id, 1, "Hello North", audience="team", team="North") == 2
+    with pytest.raises(InvalidState):
+        service.announce(game.id, 1, "Reminder", audience="unready")
+    service.run_draw(game.id, 1)
+    service.set_gift_status(game.id, 2, "ready")
+    assert service.announce(game.id, 1, "Prepare gifts", audience="unready") == 3
+    with service.sessions() as db:
+        north = db.scalars(select(Delivery).where(Delivery.text.contains("Hello North"))).all()
+        unready = db.scalars(select(Delivery).where(Delivery.text.contains("Prepare gifts"))).all()
+        assert {job.user_id for job in north} == {2, 3}
+        assert {job.user_id for job in unready} == {3, 4, 5}
+
+
+def test_helper_can_manage_logistics_but_not_see_secret_pairs(service):
+    game = game_with_players(service)
+    service.set_helper(game.id, 1, 2, True)
+    assert service.is_helper(game.id, 2)
+    assert len(service.members(game.id, 2)) == 4
+    service.set_member_team(game.id, 2, 3, "North")
+    assert service.member(game.id, 3).team == "North"
+    with pytest.raises(AccessDenied):
+        service.run_draw(game.id, 2)
+    service.run_draw(game.id, 1)
+    assert service.progress(game.id, 2)[0] == 4
+    assert service.announce(game.id, 2, "Reminder") == 4
+    with pytest.raises(AccessDenied):
+        service.all_assignments(game.id, 2)
+    with pytest.raises(AccessDenied):
+        service.set_helper(game.id, 2, 3, True)
+    service.set_helper(game.id, 1, 2, False)
+    with pytest.raises(AccessDenied):
+        service.members(game.id, 2)
+
+
+def test_replacement_requires_consent_and_preserves_matching(service):
+    game = game_with_players(service, Mode.OPEN)
+    original = service.run_draw(game.id, 1)
+    leaver = 2
+    donor = next(giver for giver, receiver in original.items() if receiver == leaver)
+    target = original[leaver]
+    with pytest.raises(AccessDenied):
+        service.create_replacement_invite(game.id, 3, leaver)
+    token = service.create_replacement_invite(game.id, 1, leaver)
+    assert service.replacement_invite(token)[0].id == game.id
+    assert service.member(game.id, leaver) is not None
+    assert service.accept_replacement(token, 5, "New") == game.id
+    assert service.member(game.id, leaver) is None
+    assert service.member(game.id, 5) is not None
+    with service.sessions() as db:
+        assignments = db.scalars(select(Assignment).where(Assignment.game_id == game.id)).all()
+        result = {item.giver_id: item.receiver_id for item in assignments}
+        assert len(result) == 4
+        assert set(result) == set(result.values()) == {1, 3, 4, 5}
+        assert result[5] == target
+        assert result[donor] == 5
+        stale = db.scalar(select(Delivery).where(Delivery.key == f"draw:{game.id}:{donor}"))
+        assert stale.state == "cancelled"
+        replacement_jobs = db.scalars(select(Delivery).where(
+            Delivery.key.like(f"replacement:{game.id}:%"))).all()
+        assert {item.user_id for item in replacement_jobs} == {leaver, donor, 5}
+    with pytest.raises(InvalidState):
+        service.accept_replacement(token, 6, "Too late")
+
+
+def test_draft_copy_and_publish(service):
+    now = utcnow()
+    source = service.create_game(1, "Host", "Original", Mode.BLIND,
+                                 budget="3000 ₽", description="Party",
+                                 registration_deadline=now + timedelta(days=2),
+                                 gift_deadline=now + timedelta(days=10),
+                                 celebration_at=now + timedelta(days=12))
+    service.edit_game(source.id, 1, rules="No spoilers")
+    clone = service.clone_game(source.id, 1)
+    assert clone.status == "draft"
+    assert clone.token != source.token
+    assert clone.rules == "No spoilers"
+    assert clone.registration_deadline is None
+    assert service.game_by_token(clone.token) is None
+    with pytest.raises(InvalidState):
+        service.join(clone.id, 2, "Two")
+    with pytest.raises(InvalidState):
+        service.publish_game(clone.id, 1)
+    service.set_game_date(clone.id, 1, "registration_deadline", now + timedelta(days=3))
+    service.set_game_date(clone.id, 1, "gift_deadline", now + timedelta(days=11))
+    service.set_game_date(clone.id, 1, "celebration_at", now + timedelta(days=13))
+    service.publish_game(clone.id, 1)
+    assert service.game_by_token(clone.token).id == clone.id
+    service.join(clone.id, 2, "Two")
