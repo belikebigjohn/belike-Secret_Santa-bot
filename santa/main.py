@@ -11,7 +11,8 @@ from santa.worker import worker
 
 async def main() -> None:
     config = Config.from_env()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    logging.basicConfig(level=config.log_level,
+                        format="%(asctime)s %(levelname)s %(name)s %(message)s")
     service = Service(config.database_url, config.owner_ids)
     service.create_schema()
     bot = Bot(config.token)
@@ -23,7 +24,9 @@ async def main() -> None:
         await dispatcher.start_polling(bot)
     finally:
         task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
         await bot.session.close()
+        service.engine.dispose()
 
 
 def run() -> None:

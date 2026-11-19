@@ -1,3 +1,5 @@
+import pytest
+
 from santa import config
 
 
@@ -16,3 +18,8 @@ def test_private_env_and_process_override(tmp_path, monkeypatch):
     assert result.owner_ids == {123}
     monkeypatch.setenv("DATABASE_URL", "sqlite:///override.db")
     assert config.Config.from_env().database_url == "sqlite:///override.db"
+    monkeypatch.setenv("LOG_LEVEL", "WARNING")
+    assert config.Config.from_env().log_level == "WARNING"
+    monkeypatch.setenv("OWNER_IDS", "")
+    with pytest.raises(RuntimeError, match="OWNER_IDS"):
+        config.Config.from_env()

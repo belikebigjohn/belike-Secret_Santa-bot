@@ -25,7 +25,9 @@ def test_alembic_creates_fresh_schema_and_is_repeatable(tmp_path):
         tables = set(inspect(connection).get_table_names())
         assert {"users", "games", "members", "assignments", "deliveries",
                 "broadcasts", "alembic_version"} <= tables
-        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0002_retire_game_messages"
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0003_delivery_queue_index"
+        assert "ix_deliveries_state_due" in {
+            item["name"] for item in inspect(connection).get_indexes("deliveries")}
 
 
 def test_alembic_upgrades_legacy_tables_without_losing_rows(tmp_path):

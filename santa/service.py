@@ -1,4 +1,6 @@
 import secrets
+import time
+from collections import Counter
 from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
@@ -42,6 +44,8 @@ class Service:
         self.engine = create_engine(url, pool_pre_ping=True)
         self.sessions = sessionmaker(self.engine, expire_on_commit=False)
         self.owner_ids = owner_ids
+        self.worker_heartbeat: datetime | None = None
+        self.rate_limited_until = 0.0
 
     def create_schema(self) -> None:
         config = Config()
@@ -644,9 +648,15 @@ class Service:
         if not self.is_owner(user_id):
             raise AccessDenied("Доступ закрыт")
         with self.sessions() as db:
+            week_ago = utcnow() - timedelta(days=7)
             return {
                 "users": db.scalar(select(func.count()).select_from(User)) or 0,
+                "users_new_week": db.scalar(select(func.count()).select_from(User).where(
+                    User.created_at >= week_ago)) or 0,
                 "games": db.scalar(select(func.count()).select_from(Game)) or 0,
+                "games_new_week": db.scalar(select(func.count()).select_from(Game).where(
+                    Game.created_at >= week_ago)) or 0,
+                "registrations": db.scalar(select(func.count()).select_from(Member)) or 0,
                 "active": db.scalar(select(func.count()).select_from(Game).where(
                     Game.status.in_(["registration", "drawn"]))) or 0,
                 "drawn": db.scalar(select(func.count()).select_from(Game).where(
@@ -666,6 +676,27 @@ class Service:
                 "deliveries_sending": db.scalar(select(func.count()).select_from(Delivery).where(
                     Delivery.state == "sending")) or 0,
             }
+
+    def owner_health(self, user_id: int) -> dict[str, int | None]:
+        if not self.is_owner(user_id):
+            raise AccessDenied("Доступ закрыт")
+        now = utcnow()
+        with self.sessions() as db:
+            oldest = db.scalar(select(func.min(Delivery.due_at)).where(
+                Delivery.state == "pending", Delivery.due_at <= now))
+            retryable = db.scalar(select(func.count()).select_from(Delivery).join(
+                User, User.id == Delivery.user_id).where(
+                    Delivery.state == "failed", Delivery.last_error != "forbidden",
+                    Delivery.key.like("broadcast:%"),
+                    User.blocked.is_(False))) or 0
+        return {
+            "worker_age_seconds": (max(0, int((now - self.worker_heartbeat).total_seconds()))
+                                   if self.worker_heartbeat else None),
+            "oldest_overdue_seconds": (max(0, int((now - oldest).total_seconds()))
+                                       if oldest else None),
+            "retryable_failures": retryable,
+            "rate_limit_seconds": max(0, int(self.rate_limited_until - time.monotonic())),
+        }
 
     @staticmethod
     def _broadcast_recipients(db: Session) -> list[int]:
@@ -736,11 +767,40 @@ class Service:
             campaign = db.get(Broadcast, broadcast_id)
             if campaign is None:
                 raise ValueError("Рассылка не найдена")
-            jobs = list(db.scalars(select(Delivery.state).where(
-                Delivery.key.like(f"broadcast:{broadcast_id}:%"))))
-            return {"state": campaign.state, "total": len(jobs),
+            job_rows = list(db.execute(select(Delivery.state, Delivery.last_error).where(
+                Delivery.key.like(f"broadcast:{broadcast_id}:%"))).all())
+            jobs = [state for state, _ in job_rows]
+            errors = Counter(error or "unknown" for state, error in job_rows if state == "failed")
+            status = ("cancelled" if campaign.state == "cancelled" else
+                      "sending" if "sending" in jobs else
+                      "scheduled" if "pending" in jobs and campaign.due_at > utcnow() else
+                      "queued" if "pending" in jobs else
+                      "failed" if "failed" in jobs else "finished")
+            return {"state": status, "total": len(jobs),
                     "sent": jobs.count("sent"), "failed": jobs.count("failed"),
-                    "pending": jobs.count("pending"), "cancelled": jobs.count("cancelled")}
+                    "pending": jobs.count("pending"), "sending": jobs.count("sending"),
+                    "cancelled": jobs.count("cancelled"),
+                    "errors": ", ".join(f"{name}: {count}" for name, count in errors.most_common(3))}
+
+    def retry_failed_broadcast(self, owner_id: int, broadcast_id: int) -> int:
+        if not self.is_owner(owner_id):
+            raise AccessDenied("Доступ закрыт")
+        with self.sessions.begin() as db:
+            campaign = db.get(Broadcast, broadcast_id)
+            if campaign is None:
+                raise ValueError("Рассылка не найдена")
+            if campaign.state == "cancelled":
+                raise InvalidState("Рассылка отменена")
+            jobs = db.scalars(select(Delivery).join(User, User.id == Delivery.user_id).where(
+                Delivery.key.like(f"broadcast:{broadcast_id}:%"),
+                Delivery.state == "failed", Delivery.last_error != "forbidden",
+                User.blocked.is_(False)).with_for_update(skip_locked=True)).all()
+            for job in jobs:
+                job.state = "pending"
+                job.attempts = 0
+                job.due_at = utcnow()
+                job.last_error = ""
+            return len(jobs)
 
     def cancel_broadcast(self, owner_id: int, broadcast_id: int) -> int:
         if not self.is_owner(owner_id):

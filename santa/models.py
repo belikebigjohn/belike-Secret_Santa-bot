@@ -6,6 +6,7 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -151,7 +152,7 @@ class Assignment(Base):
 
 class Delivery(Base):
     __tablename__ = "deliveries"
-    __table_args__ = (UniqueConstraint("key"),)
+    __table_args__ = (UniqueConstraint("key"), Index("ix_deliveries_state_due", "state", "due_at"))
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     key: Mapped[str] = mapped_column(String(160))
     user_id: Mapped[int] = mapped_column(BigInteger)

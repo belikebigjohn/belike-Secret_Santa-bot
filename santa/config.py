@@ -23,6 +23,7 @@ class Config:
     token: str
     database_url: str
     owner_ids: frozenset[int]
+    log_level: str = "INFO"
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -31,8 +32,16 @@ class Config:
         def value(name: str, default: str = "") -> str:
             return os.environ.get(name, file_values.get(name, default))
 
-        token = value("BOT_TOKEN")
+        token = value("BOT_TOKEN").strip()
         if not token or token == "PASTE_YOUR_BOT_TOKEN_HERE":
             raise RuntimeError("Вставьте Telegram-токен в BOT_TOKEN файла .env")
-        ids = frozenset(int(part.strip()) for part in value("OWNER_IDS").split(",") if part.strip())
-        return cls(token, value("DATABASE_URL", "sqlite:///santa.db"), ids)
+        try:
+            ids = frozenset(int(part.strip()) for part in value("OWNER_IDS").split(",") if part.strip())
+        except ValueError as exc:
+            raise RuntimeError("OWNER_IDS должен содержать Telegram ID через запятую") from exc
+        if not ids or any(user_id <= 0 for user_id in ids):
+            raise RuntimeError("Укажите хотя бы один положительный Telegram ID в OWNER_IDS")
+        level = value("LOG_LEVEL", "INFO").upper()
+        if level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+            raise RuntimeError("LOG_LEVEL должен быть DEBUG, INFO, WARNING, ERROR или CRITICAL")
+        return cls(token, value("DATABASE_URL", "sqlite:///santa.db"), ids, level)

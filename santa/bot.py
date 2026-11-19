@@ -920,9 +920,12 @@ def create_router(service: Service, bot_username: str) -> Router:
         stats = service.owner_stats(message.from_user.id)
         await screen(message, "🛠 <b>Сводка бота</b>\n\n"
                      f"Пользователей: {stats['users']}\n"
+                     f"Новых за 7 дней: {stats['users_new_week']}\n"
                      f"Доступны для рассылки: {stats['reachable_users']}\n"
                      f"Заблокировали бота: {stats['blocked_users']}\n"
                      f"Игр: {stats['games']}\n"
+                     f"Новых игр за 7 дней: {stats['games_new_week']}\n"
+                     f"Регистраций в играх: {stats['registrations']}\n"
                      f"Активных игр: {stats['active']}\n"
                      f"После жеребьёвки: {stats['drawn']}\n"
                      f"Завершённых: {stats['finished']}\n"
@@ -931,6 +934,27 @@ def create_router(service: Service, bot_username: str) -> Router:
                      f"Отправляются: {stats['deliveries_sending']}\n"
                      f"Ошибок доставки: {stats['deliveries_failed']}",
                      kb(("📬 Новая рассылка", "adminbroadcast:new"),
+                        ("📊 Рассылки", "adminbroadcast:list"),
+                        ("🩺 Состояние", "adminhealth"),
+                        ("⬅️ Главное меню", "home")))
+
+    @router.callback_query(F.data == "adminhealth")
+    async def admin_health(call: CallbackQuery):
+        try:
+            status = service.owner_health(call.from_user.id)
+        except AccessDenied as exc:
+            await call.answer(str(exc), show_alert=True)
+            return
+        worker_age = status["worker_age_seconds"]
+        overdue = status["oldest_overdue_seconds"]
+        await call.answer()
+        await screen(call.message, "🩺 <b>Состояние бота</b>\n\n"
+                     f"Фоновая отправка: {'работает' if worker_age is not None and worker_age < 30 else 'нет свежего сигнала'}"
+                     f"{f' · {worker_age} с назад' if worker_age is not None else ''}\n"
+                     f"Самое старое просроченное сообщение: {f'{overdue} с' if overdue is not None else 'нет'}\n"
+                     f"Пауза Telegram API: {status['rate_limit_seconds']} с\n"
+                     f"Временных ошибок для повтора: {status['retryable_failures']}",
+                     kb(("🔄 Обновить", "adminhealth"),
                         ("📊 Рассылки", "adminbroadcast:list"),
                         ("⬅️ Главное меню", "home")))
 
@@ -1088,7 +1112,7 @@ def create_router(service: Service, bot_username: str) -> Router:
             return
         await state.clear()
         await call.answer("Рассылка запланирована")
-        await screen(call.message, f"📬 Рассылка #{campaign_id} поставлена в очередь для {count} подписчиков.",
+        await screen(call.message, f"📬 Рассылка #{campaign_id} поставлена в очередь для {count} пользователей.",
                      kb(("📊 Статус", f"adminstats:{campaign_id}"),
                         ("⬅️ Главное меню", "home")))
 
@@ -1100,8 +1124,9 @@ def create_router(service: Service, bot_username: str) -> Router:
             await call.answer(str(exc), show_alert=True)
             return
         await call.answer()
-        await screen(call.message, "📊 <b>Последние рассылки</b>",
-                     kb(*[(f"#{item.id} · {item.segment}", f"adminstats:{item.id}")
+        await screen(call.message, "📊 <b>Последние рассылки</b>\n\n"
+                     + ("Выберите рассылку." if campaigns else "Пока нет рассылок."),
+                     kb(*[(f"#{item.id} · {' '.join(item.text.split())[:25]}", f"adminstats:{item.id}")
                           for item in campaigns], ("⬅️ Главное меню", "home")))
 
     @router.callback_query(F.data.startswith("adminstats:"))
@@ -1113,14 +1138,36 @@ def create_router(service: Service, bot_username: str) -> Router:
             await call.answer(str(exc), show_alert=True)
             return
         await call.answer()
+        names = {"queued": "в очереди", "sending": "отправляется", "finished": "завершена",
+                 "scheduled": "запланирована", "failed": "есть ошибки", "cancelled": "отменена"}
+        error_note = f"\nПричины ошибок: {escape(stats['errors'])}" if stats["errors"] else ""
+        actions = []
+        if stats["failed"] and stats["state"] != "cancelled":
+            actions.append(("🔁 Повторить ошибки", f"adminretry:{campaign_id}"))
+        if stats["pending"]:
+            actions.append(("✖ Отменить ожидающие", f"admincancel:{campaign_id}"))
         await screen(call.message, f"📊 <b>Рассылка #{campaign_id}</b>\n\n"
+                     f"Состояние: {names.get(stats['state'], stats['state'])}\n"
                      f"Всего: {stats['total']}\nОтправлено: {stats['sent']}\n"
-                     f"Ожидают: {stats['pending']}\nОшибки: {stats['failed']}\n"
-                     f"Отменено: {stats['cancelled']}",
-                     kb(("✖ Отменить ожидающие", f"admincancel:{campaign_id}"),
-                        ("⬅️ К рассылкам", "adminbroadcast:list")))
+                     f"Ожидают: {stats['pending']}\nОтправляются: {stats['sending']}\n"
+                     f"Ошибки: {stats['failed']}\n"
+                     f"Отменено: {stats['cancelled']}{error_note}",
+                     kb(*actions, ("⬅️ К рассылкам", "adminbroadcast:list")))
 
     @router.callback_query(F.data.startswith("admincancel:"))
+    async def admin_broadcast_cancel_prompt(call: CallbackQuery):
+        campaign_id = int(call.data.split(":")[1])
+        try:
+            stats = service.broadcast_stats(call.from_user.id, campaign_id)
+        except ValueError as exc:
+            await call.answer(str(exc), show_alert=True)
+            return
+        await call.answer()
+        await screen(call.message, f"✖ Отменить {stats['pending']} ожидающих сообщений рассылки #{campaign_id}?",
+                     kb(("✅ Подтвердить отмену", f"admincancelconfirm:{campaign_id}"),
+                        ("⬅️ К рассылке", f"adminstats:{campaign_id}")))
+
+    @router.callback_query(F.data.startswith("admincancelconfirm:"))
     async def admin_broadcast_cancel(call: CallbackQuery):
         campaign_id = int(call.data.split(":")[1])
         try:
@@ -1130,6 +1177,33 @@ def create_router(service: Service, bot_username: str) -> Router:
             return
         await call.answer("Отменено")
         await screen(call.message, f"✖ Отменено {count} ожидающих сообщений.",
+                     kb(("📊 Статус", f"adminstats:{campaign_id}"),
+                        ("⬅️ Главное меню", "home")))
+
+    @router.callback_query(F.data.startswith("adminretry:"))
+    async def admin_retry_prompt(call: CallbackQuery):
+        campaign_id = int(call.data.split(":")[1])
+        try:
+            stats = service.broadcast_stats(call.from_user.id, campaign_id)
+        except ValueError as exc:
+            await call.answer(str(exc), show_alert=True)
+            return
+        await call.answer()
+        await screen(call.message, f"🔁 Повторить временные ошибки рассылки #{campaign_id}?\n\n"
+                     f"Неудачных отправок: {stats['failed']}. Блокировки Telegram повторяться не будут.",
+                     kb(("✅ Подтвердить повтор", f"adminretryconfirm:{campaign_id}"),
+                        ("⬅️ К рассылке", f"adminstats:{campaign_id}")))
+
+    @router.callback_query(F.data.startswith("adminretryconfirm:"))
+    async def admin_retry_confirm(call: CallbackQuery):
+        campaign_id = int(call.data.split(":")[1])
+        try:
+            count = service.retry_failed_broadcast(call.from_user.id, campaign_id)
+        except ValueError as exc:
+            await call.answer(str(exc), show_alert=True)
+            return
+        await call.answer("Поставлено в очередь")
+        await screen(call.message, f"🔁 Повторно поставлено в очередь: {count}.",
                      kb(("📊 Статус", f"adminstats:{campaign_id}"),
                         ("⬅️ Главное меню", "home")))
 

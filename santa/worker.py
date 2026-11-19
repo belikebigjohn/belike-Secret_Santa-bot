@@ -1,7 +1,9 @@
 import asyncio
 import logging
+import os
 import time
 from datetime import timedelta
+from pathlib import Path
 
 from aiogram import Bot
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
@@ -51,6 +53,8 @@ async def deliver_once(service: Service, bot: Bot) -> int:
                 job.claimed_at = None
                 job.last_error = "forbidden"
     except TelegramRetryAfter as exc:
+        service.rate_limited_until = max(service.rate_limited_until,
+                                         time.monotonic() + exc.retry_after)
         with service.sessions.begin() as db:
             job = db.get(Delivery, job_id)
             if job is not None:
@@ -95,11 +99,20 @@ async def worker(service: Service, bot: Bot) -> None:
     # A stale claim is retried; this narrow case can duplicate a message.
     recover_stale(service)
     next_recovery_check = 0.0
+    next_file_heartbeat = 0.0
+    health_file = os.environ.get("WORKER_HEALTH_FILE")
     while True:
         try:
+            service.worker_heartbeat = utcnow()
+            if health_file and time.monotonic() >= next_file_heartbeat:
+                Path(health_file).touch()
+                next_file_heartbeat = time.monotonic() + 10
             if time.monotonic() >= next_recovery_check:
                 recover_stale(service)
                 next_recovery_check = time.monotonic() + 60
+            if time.monotonic() < service.rate_limited_until:
+                await asyncio.sleep(min(5, service.rate_limited_until - time.monotonic()))
+                continue
             if not await deliver_once(service, bot):
                 await asyncio.sleep(5)
         except Exception:

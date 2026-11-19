@@ -16,9 +16,19 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgresql+psycopg://santa:${POSTGRES_PASSWORD}@db:5432/santa
+      WORKER_HEALTH_FILE: /tmp/santa-worker-heartbeat
     depends_on:
       db:
         condition: service_healthy
     restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
 volumes:
   pgdata:

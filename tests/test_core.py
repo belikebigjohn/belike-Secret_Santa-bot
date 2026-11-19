@@ -1,3 +1,4 @@
+import time
 from datetime import timedelta
 
 import pytest
@@ -392,6 +393,43 @@ def test_broadcast_media_and_button_payload(service):
         assert job.media_file_id == "telegram-photo"
         assert job.button_text == "Open"
         assert job.button_url == "https://example.com/path"
+
+
+def test_admin_health_and_retry_transient_broadcast_failures(service):
+    for user_id in (99, 1, 2):
+        service.ensure_user(user_id, str(user_id))
+    with pytest.raises(AccessDenied):
+        service.owner_health(1)
+    assert service.owner_health(99)["worker_age_seconds"] is None
+    service.worker_heartbeat = utcnow()
+    assert service.owner_health(99)["worker_age_seconds"] < 5
+    service.rate_limited_until = time.monotonic() + 10
+    assert service.owner_health(99)["rate_limit_seconds"] > 0
+    campaign_id, count = service.create_broadcast(99, "Hello")
+    assert count == 3
+    with service.sessions.begin() as db:
+        transient = db.scalar(select(Delivery).where(
+            Delivery.key == f"broadcast:{campaign_id}:1"))
+        transient.state = "failed"
+        transient.last_error = "TimeoutError"
+        transient.attempts = 5
+        forbidden = db.scalar(select(Delivery).where(
+            Delivery.key == f"broadcast:{campaign_id}:2"))
+        forbidden.state = "failed"
+        forbidden.last_error = "forbidden"
+    assert service.broadcast_stats(99, campaign_id)["failed"] == 2
+    assert "TimeoutError: 1" in service.broadcast_stats(99, campaign_id)["errors"]
+    assert service.owner_health(99)["retryable_failures"] == 1
+    with pytest.raises(AccessDenied):
+        service.retry_failed_broadcast(1, campaign_id)
+    assert service.retry_failed_broadcast(99, campaign_id) == 1
+    with service.sessions() as db:
+        job = db.scalar(select(Delivery).where(
+            Delivery.key == f"broadcast:{campaign_id}:1"))
+        assert (job.state, job.attempts, job.last_error) == ("pending", 0, "")
+    assert service.cancel_broadcast(99, campaign_id) == 2
+    with pytest.raises(InvalidState):
+        service.retry_failed_broadcast(99, campaign_id)
 
 
 def test_recover_stale_delivery_preserves_recent_claim(service):
