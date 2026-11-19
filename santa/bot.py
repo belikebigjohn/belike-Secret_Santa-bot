@@ -17,7 +17,7 @@ from aiogram.types import (
     Message,
 )
 
-from santa.formatting import profile_link
+from santa.formatting import limited_html, profile_link
 from santa.models import Mode, utcnow
 from santa.service import AccessDenied, InvalidState, Service
 
@@ -79,6 +79,19 @@ def kb(*items: tuple[str, str]) -> InlineKeyboardMarkup:
     if pending:
         rows.append([pending])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def page_buttons(prefix: str, page: int, total: int, size: int = 8) -> list[tuple[str, str]]:
+    buttons = []
+    if page > 0:
+        buttons.append(("◀️ Назад", f"{prefix}:{page - 1}"))
+    if (page + 1) * size < total:
+        buttons.append(("Далее ▶️", f"{prefix}:{page + 1}"))
+    return buttons
+
+
+def page_slice(items: list, page: int, size: int = 8) -> list:
+    return items[page * size:(page + 1) * size]
 
 
 def create_router(service: Service, bot_username: str) -> Router:
@@ -213,9 +226,10 @@ def create_router(service: Service, bot_username: str) -> Router:
             token = message.text.split("join_", 1)[1].split()[0]
             game = service.game_by_token(token)
             if game:
-                await screen(message, f"🎄 <b>{escape(game.title)}</b>\n{escape(game.description)}\n"
-                             f"Бюджет: {escape(game.budget)}\n"
-                             f"Правила: {escape(game.rules or 'не указаны')}",
+                await screen(message, f"🎄 <b>{limited_html(game.title, 300)}</b>\n"
+                             f"{limited_html(game.description, 700)}\n"
+                             f"Бюджет: {limited_html(game.budget, 250)}\n"
+                             f"Правила: {limited_html(game.rules or 'не указаны', 700)}",
                              kb(("Участвовать", f"join:{game.id}"),
                                 ("⬅️ Главное меню", "home")), art=game.cover_file_id or WELCOME_ART)
                 return
@@ -386,10 +400,10 @@ def create_router(service: Service, bot_username: str) -> Router:
         await call.answer()
         member = service.member(game_id, call.from_user.id)
         await screen(call.message, "📝 <b>Моя анкета</b>\n\n"
-                     f"<b>Пожелания:</b> {escape(member.wishes or 'не указаны')}\n\n"
-                     f"<b>Интересы:</b> {escape(member.interests or 'не указаны')}\n\n"
-                     f"<b>Не дарить:</b> {escape(member.avoid or 'не указано')}\n\n"
-                     f"<b>Вишлист:</b> {escape(member.wishlist_url or 'не указан')}",
+                     f"<b>Пожелания:</b> {limited_html(member.wishes or 'не указаны', 900)}\n\n"
+                     f"<b>Интересы:</b> {limited_html(member.interests or 'не указаны', 900)}\n\n"
+                     f"<b>Не дарить:</b> {limited_html(member.avoid or 'не указано', 900)}\n\n"
+                     f"<b>Вишлист:</b> {limited_html(member.wishlist_url or 'не указан', 450)}",
                      kb(("🎁 Пожелания", f"field:{game_id}:wishes"),
                         ("🎨 Интересы", f"field:{game_id}:interests"),
                         ("🚫 Не дарить", f"field:{game_id}:avoid"),
@@ -440,10 +454,10 @@ def create_router(service: Service, bot_username: str) -> Router:
             return
         receiver, game_ = result
         await screen(call.message, f"🎁 <b>Твоя миссия</b>\n\n"
-                     f"<b>Получатель:</b> {profile_link(receiver.user_id, receiver.nickname)}\n\n"
-                     f"<b>Пожелания:</b> {escape(receiver.wishes or 'не указаны')}\n\n"
-                     f"<b>Не дарить:</b> {escape(receiver.avoid or 'не указано')}\n\n"
-                     f"<b>Бюджет:</b> {escape(game_.budget)}",
+                     f"<b>Получатель:</b> {profile_link(receiver.user_id, receiver.nickname[:70])}\n\n"
+                     f"<b>Пожелания:</b> {limited_html(receiver.wishes or 'не указаны', 1200)}\n\n"
+                     f"<b>Не дарить:</b> {limited_html(receiver.avoid or 'не указано', 1200)}\n\n"
+                     f"<b>Бюджет:</b> {limited_html(game_.budget, 250)}",
                       kb(("🛍 Выбираю подарок", f"giftstatus:{game_id}:choosing"),
                          ("🛒 Подарок куплен", f"giftstatus:{game_id}:bought"),
                          ("✅ Подарок готов", f"giftstatus:{game_id}:ready"),
@@ -476,13 +490,17 @@ def create_router(service: Service, bot_username: str) -> Router:
 
     @router.callback_query(F.data.startswith("members:"))
     async def members(call: CallbackQuery):
-        game_id = int(call.data.split(":")[1])
+        parts = call.data.split(":")
+        game_id = int(parts[1])
+        page = max(0, int(parts[2])) if len(parts) > 2 else 0
         try:
             people = service.members(game_id, call.from_user.id)
             await call.answer()
-            await screen(call.message, "👥 <b>Участники</b>\n\n" + "\n".join(
-                f"• {profile_link(p.user_id, p.nickname)}" for p in people),
-                kb(("⬅️ К игре", f"game:{game_id}")))
+            await screen(call.message, f"👥 <b>Участники: {len(people)}</b>\n\n" + "\n".join(
+                f"{i}. {profile_link(p.user_id, p.nickname[:70])}"
+                for i, p in enumerate(page_slice(people, page), page * 8 + 1)),
+                kb(*page_buttons(f"members:{game_id}", page, len(people)),
+                   ("⬅️ К игре", f"game:{game_id}")))
         except AccessDenied as exc:
             await call.answer(str(exc), show_alert=True)
 
@@ -587,13 +605,17 @@ def create_router(service: Service, bot_username: str) -> Router:
     @router.callback_query(F.data.startswith("pairs:"))
     async def pairs(call: CallbackQuery):
         try:
-            game_id = int(call.data.split(":")[1])
+            parts = call.data.split(":")
+            game_id = int(parts[1])
+            page = max(0, int(parts[2])) if len(parts) > 2 else 0
             pairs_ = service.all_assignments(game_id, call.from_user.id)
             await call.answer()
-            await screen(call.message, "🔐 <b>Распределение</b>\n\n" + "\n".join(
-                f"{profile_link(giver.user_id, giver.nickname)} → "
-                f"{profile_link(receiver.user_id, receiver.nickname)}" for giver, receiver in pairs_),
-                kb(("⬅️ К игре", f"game:{game_id}")))
+            await screen(call.message, f"🔐 <b>Распределение: {len(pairs_)}</b>\n\n" + "\n".join(
+                f"{profile_link(giver.user_id, giver.nickname[:30])} → "
+                f"{profile_link(receiver.user_id, receiver.nickname[:30])}"
+                for giver, receiver in page_slice(pairs_, page)),
+                kb(*page_buttons(f"pairs:{game_id}", page, len(pairs_)),
+                   ("⬅️ К игре", f"game:{game_id}")))
         except ValueError as exc:
             await call.answer(str(exc), show_alert=True)
 
@@ -788,32 +810,46 @@ def create_router(service: Service, bot_username: str) -> Router:
 
     @router.callback_query(F.data.startswith("exclusions:"))
     async def exclusions(call: CallbackQuery):
-        game_id = int(call.data.split(":")[1])
+        parts = call.data.split(":")
+        game_id = int(parts[1])
+        people_page = max(0, int(parts[2])) if len(parts) > 2 else 0
+        exclusion_page = max(0, int(parts[3])) if len(parts) > 3 else 0
         try:
             people = service.members(game_id, call.from_user.id)
             existing = service.exclusions(game_id, call.from_user.id)
             names = {p.user_id: p for p in people}
-            lines = [f"{index}. {profile_link(p.user_id, p.nickname)}" for index, p in enumerate(people[:30], 1)]
-            excluded = [f"{index}. {profile_link(names[e.giver_id].user_id, names[e.giver_id].nickname)}"
-                        f" → {profile_link(names[e.receiver_id].user_id, names[e.receiver_id].nickname)}"
-                        for index, e in enumerate(existing[:30], 1)
+            lines = [f"{index}. {profile_link(p.user_id, p.nickname[:30])}"
+                     for index, p in enumerate(page_slice(people, people_page), people_page * 8 + 1)]
+            excluded = [f"{index}. {profile_link(names[e.giver_id].user_id, names[e.giver_id].nickname[:30])}"
+                        f" → {profile_link(names[e.receiver_id].user_id, names[e.receiver_id].nickname[:30])}"
+                        for index, e in enumerate(page_slice(existing, exclusion_page, 4), exclusion_page * 4 + 1)
                         if e.giver_id in names and e.receiver_id in names]
             buttons = [(f"➕ №{index}", f"exgiver:{game_id}:{p.user_id}")
-                       for index, p in enumerate(people[:30], 1)]
+                       for index, p in enumerate(page_slice(people, people_page), people_page * 8 + 1)]
+            if people_page > 0:
+                buttons.append(("◀️ Участники", f"exclusions:{game_id}:{people_page - 1}:{exclusion_page}"))
+            if (people_page + 1) * 8 < len(people):
+                buttons.append(("Участники ▶️", f"exclusions:{game_id}:{people_page + 1}:{exclusion_page}"))
             buttons += [(f"✖ №{index}", f"exremove:{game_id}:{e.giver_id}:{e.receiver_id}")
-                        for index, e in enumerate(existing[:30], 1)]
+                        for index, e in enumerate(page_slice(existing, exclusion_page, 4), exclusion_page * 4 + 1)]
+            if exclusion_page > 0:
+                buttons.append(("◀️ Запреты", f"exclusions:{game_id}:{people_page}:{exclusion_page - 1}"))
+            if (exclusion_page + 1) * 4 < len(existing):
+                buttons.append(("Запреты ▶️", f"exclusions:{game_id}:{people_page}:{exclusion_page + 1}"))
             await call.answer()
             await screen(call.message, "🚫 <b>Запреты направленных пар</b>\n\n"
-                         "<b>Выберите дарителя:</b>\n" + ("\n".join(lines) or "Участников нет.")
-                         + "\n\n<b>Текущие запреты:</b>\n" + ("\n".join(excluded) or "Нет."),
+                         f"<b>Выберите дарителя ({len(people)}):</b>\n" + ("\n".join(lines) or "Участников нет.")
+                         + f"\n\n<b>Текущие запреты ({len(existing)}):</b>\n" + ("\n".join(excluded) or "Нет."),
                          kb(*buttons, ("⬅️ К настройкам", f"settings:{game_id}")))
         except ValueError as exc:
             await call.answer(str(exc), show_alert=True)
 
     @router.callback_query(F.data.startswith("exgiver:"))
     async def ex_giver(call: CallbackQuery):
-        _, game_text, giver_text = call.data.split(":")
+        parts = call.data.split(":")
+        _, game_text, giver_text = parts[:3]
         game_id, giver_id = int(game_text), int(giver_text)
+        page = max(0, int(parts[3])) if len(parts) > 3 else 0
         try:
             people = service.members(game_id, call.from_user.id)
             if giver_id not in {p.user_id for p in people}:
@@ -821,10 +857,11 @@ def create_router(service: Service, bot_username: str) -> Router:
             await call.answer()
             candidates = [p for p in people if p.user_id != giver_id]
             await screen(call.message, "Кому нельзя дарить подарок?\n\n" +
-                         "\n".join(f"{i}. {profile_link(p.user_id, p.nickname)}"
-                                   for i, p in enumerate(candidates[:30], 1)),
+                         "\n".join(f"{i}. {profile_link(p.user_id, p.nickname[:65])}"
+                                   for i, p in enumerate(page_slice(candidates, page), page * 8 + 1)),
                          kb(*[(f"Выбрать №{i}", f"exadd:{game_id}:{giver_id}:{p.user_id}")
-                              for i, p in enumerate(candidates[:30], 1)],
+                              for i, p in enumerate(page_slice(candidates, page), page * 8 + 1)],
+                            *page_buttons(f"exgiver:{game_id}:{giver_id}", page, len(candidates)),
                             ("⬅️ К запретам", f"exclusions:{game_id}")))
         except ValueError as exc:
             await call.answer(str(exc), show_alert=True)
@@ -957,16 +994,19 @@ def create_router(service: Service, bot_username: str) -> Router:
 
     @router.callback_query(F.data.startswith("transfer:"))
     async def transfer_prompt(call: CallbackQuery):
-        game_id = int(call.data.split(":")[1])
+        parts = call.data.split(":")
+        game_id = int(parts[1])
+        page = max(0, int(parts[2])) if len(parts) > 2 else 0
         try:
             people = service.members(game_id, call.from_user.id)
             await call.answer()
             candidates = [p for p in people if p.user_id != call.from_user.id]
             await screen(call.message, "👑 Выберите нового ведущего:\n\n" +
-                         "\n".join(f"{i}. {profile_link(p.user_id, p.nickname)}"
-                                   for i, p in enumerate(candidates[:30], 1)),
+                         "\n".join(f"{i}. {profile_link(p.user_id, p.nickname[:65])}"
+                                   for i, p in enumerate(page_slice(candidates, page), page * 8 + 1)),
                          kb(*[(f"Выбрать №{i}", f"sethost:{game_id}:{p.user_id}")
-                              for i, p in enumerate(candidates[:30], 1)],
+                              for i, p in enumerate(page_slice(candidates, page), page * 8 + 1)],
+                            *page_buttons(f"transfer:{game_id}", page, len(candidates)),
                             ("⬅️ К настройкам", f"settings:{game_id}")))
         except ValueError as exc:
             await call.answer(str(exc), show_alert=True)

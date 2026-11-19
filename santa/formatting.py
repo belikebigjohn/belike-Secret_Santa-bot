@@ -3,6 +3,20 @@
 from html import escape
 
 
+def limited_html(value: str, limit: int) -> str:
+    """Escape text while keeping the HTML payload within a Telegram-safe budget."""
+    parts = []
+    length = 0
+    for character in value:
+        encoded = escape(character)
+        if length + len(encoded) > limit - 1:
+            parts.append("…")
+            break
+        parts.append(encoded)
+        length += len(encoded)
+    return "".join(parts)
+
+
 def profile_link(user_id: int, name: str) -> str:
     """Link a known Telegram user by numeric ID, even without a public username."""
     return f'<a href="tg://user?id={int(user_id)}">{escape(name)}</a>'

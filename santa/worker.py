@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from datetime import timedelta
 
 from aiogram import Bot
@@ -63,9 +64,12 @@ async def worker(service: Service, bot: Bot) -> None:
     with service.sessions.begin() as db:
         for job in db.scalars(select(Delivery).where(Delivery.state == "sending")):
             job.state = "pending"
+    next_reminder_check = 0.0
     while True:
         try:
-            service.schedule_reminders()
+            if time.monotonic() >= next_reminder_check:
+                service.schedule_reminders()
+                next_reminder_check = time.monotonic() + 60
             if not await deliver_once(service, bot):
                 await asyncio.sleep(5)
         except Exception:

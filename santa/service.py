@@ -1,13 +1,12 @@
 import secrets
 from datetime import UTC, datetime, timedelta
-from html import escape
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import create_engine, delete, func, inspect, or_, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from santa.draw import draw
-from santa.formatting import profile_link
+from santa.formatting import limited_html, profile_link
 from santa.models import (
     Assignment,
     Base,
@@ -377,11 +376,11 @@ class Service:
                 db.add(Assignment(game_id=game_id, giver_id=giver, receiver_id=receiver))
                 target = by_id[receiver]
                 db.add(Delivery(key=f"draw:{game_id}:{giver}", user_id=giver,
-                                text=f"🎁 Твоя миссия в игре «{escape(game.title)}»: подарок для "
-                                     f"{profile_link(target.user_id, target.nickname)}.\n"
-                                     f"Пожелания: {escape(target.wishes or 'пока не заполнены')}\n"
-                                     f"Не дарить: {escape(target.avoid or 'не указано')}\n"
-                                     f"Бюджет: {escape(game.budget)}", parse_mode="HTML"))
+                                text=f"🎁 Твоя миссия в игре «{limited_html(game.title, 300)}»: подарок для "
+                                     f"{profile_link(target.user_id, target.nickname[:70])}.\n"
+                                     f"Пожелания: {limited_html(target.wishes or 'пока не заполнены', 1000)}\n"
+                                     f"Не дарить: {limited_html(target.avoid or 'не указано', 1000)}\n"
+                                     f"Бюджет: {limited_html(game.budget, 250)}", parse_mode="HTML"))
             game.status = "drawn"
             return result
 

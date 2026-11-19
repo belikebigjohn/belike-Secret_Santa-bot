@@ -1,4 +1,4 @@
-"""Uniformly shuffled backtracking for constrained perfect matching."""
+"""Randomized, polynomial-time matching for Secret Santa assignments."""
 import secrets
 
 
@@ -12,42 +12,38 @@ def draw(ids: list[int], forbidden: set[tuple[int, int]] | None = None) -> dict[
         raise ImpossibleDraw("Для жеребьёвки нужны минимум два участника")
     forbidden = forbidden or set()
     rng = secrets.SystemRandom()
-    order = ids[:]
-    rng.shuffle(order)
-    options = {giver: [r for r in ids if r != giver and (giver, r) not in forbidden] for giver in ids}
+    # A single cycle avoids mutual pairs. Keep this search bounded: some valid
+    # matchings cannot form one cycle, and unbounded backtracking can stall.
+    for _ in range(32):
+        order = ids[:]
+        rng.shuffle(order)
+        cycle = {order[i]: order[(i + 1) % len(order)] for i in range(len(order))}
+        if all((giver, receiver) not in forbidden for giver, receiver in cycle.items()):
+            return cycle
+
+    options = {giver: [receiver for receiver in ids
+                       if receiver != giver and (giver, receiver) not in forbidden]
+               for giver in ids}
     if any(not choices for choices in options.values()):
         raise ImpossibleDraw("Для одного из участников нет допустимого получателя")
-    # Prefer one long cycle when possible; it prevents mutual pairs for 3+ players.
-    def solve(single_cycle: bool) -> dict[int, int] | None:
-        assigned: dict[int, int] = {}
-        used: set[int] = set()
+    for choices in options.values():
+        rng.shuffle(choices)
+    givers = ids[:]
+    rng.shuffle(givers)
+    receiver_to_giver: dict[int, int] = {}
 
-        def visit(left: list[int]) -> bool:
-            if not left:
-                if not single_cycle:
-                    return True
-                seen = {ids[0]}
-                node = assigned[ids[0]]
-                while node not in seen:
-                    seen.add(node)
-                    node = assigned[node]
-                return node == ids[0] and len(seen) == len(ids)
-            giver = min(left, key=lambda x: sum(r not in used for r in options[x]))
-            choices = [r for r in options[giver] if r not in used]
-            rng.shuffle(choices)
-            for receiver in choices:
-                assigned[giver] = receiver
-                used.add(receiver)
-                if visit([x for x in left if x != giver]):
-                    return True
-                used.remove(receiver)
-                del assigned[giver]
-            return False
+    def augment(giver: int, seen: set[int]) -> bool:
+        for receiver in options[giver]:
+            if receiver in seen:
+                continue
+            seen.add(receiver)
+            previous = receiver_to_giver.get(receiver)
+            if previous is None or augment(previous, seen):
+                receiver_to_giver[receiver] = giver
+                return True
+        return False
 
-        return assigned if visit(order) else None
-
-    result = solve(True) if len(ids) > 2 else None
-    result = result or solve(False)
-    if result is None:
-        raise ImpossibleDraw("Ограничения несовместимы: попробуйте убрать запреты пар")
-    return result
+    for giver in givers:
+        if not augment(giver, set()):
+            raise ImpossibleDraw("Ограничения несовместимы: попробуйте убрать запреты пар")
+    return {giver: receiver for receiver, giver in receiver_to_giver.items()}

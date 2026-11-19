@@ -265,3 +265,60 @@ def test_game_view_preserves_access_and_host_count(service):
     assert member_view is not None and member_view[1].user_id == 2
     assert member_view[2] is None
     assert service.game_view(game.id, 99) is None
+
+
+@pytest.mark.parametrize("mode", [Mode.BLIND, Mode.HOST])
+def test_eighty_player_game_has_exactly_one_giver_and_receiver(service, mode):
+    game = service.create_game(1, "Host", "Company holiday", mode)
+    expected = set(range(1, 81)) if mode == Mode.BLIND else set(range(2, 82))
+    for user_id in sorted(expected - {1}):
+        service.join(game.id, user_id, f"Player {user_id}")
+    result = service.run_draw(game.id, 1)
+    assert len(result) == 80
+    assert set(result) == expected
+    assert set(result.values()) == expected
+    assert all(giver != receiver for giver, receiver in result.items())
+    with service.sessions() as db:
+        assignments = db.scalars(select(Assignment).where(Assignment.game_id == game.id)).all()
+        deliveries = db.scalars(select(Delivery).where(Delivery.key.like(f"draw:{game.id}:%"))).all()
+        assert len(assignments) == len(deliveries) == 80
+        assert {item.giver_id for item in assignments} == expected
+        assert {item.receiver_id for item in assignments} == expected
+        assert {item.user_id for item in deliveries} == expected
+    with pytest.raises(InvalidState):
+        service.join(game.id, 999, "Late")
+    if mode == Mode.BLIND:
+        with pytest.raises(AccessDenied):
+            service.all_assignments(game.id, 1)
+    else:
+        assert len(service.all_assignments(game.id, 1)) == 80
+
+
+def test_eighty_player_constrained_matching_without_single_cycle():
+    ids = list(range(80))
+    forbidden = {(giver, receiver) for giver in ids for receiver in ids
+                 if giver // 40 != receiver // 40}
+    for _ in range(5):
+        result = draw(ids, forbidden)
+        assert set(result) == set(result.values()) == set(ids)
+        assert all(giver != receiver and (giver, receiver) not in forbidden
+                   for giver, receiver in result.items())
+
+
+def test_impossible_eighty_player_matching_fails_cleanly():
+    ids = list(range(80))
+    # Two givers share the same sole possible receiver: no perfect matching exists.
+    forbidden = {(giver, receiver) for giver in (0, 1) for receiver in ids if receiver != 79}
+    with pytest.raises(ImpossibleDraw):
+        draw(ids, forbidden)
+
+
+def test_draw_notification_stays_within_telegram_limit(service):
+    game = service.create_game(1, "Host", "<" * 120, Mode.BLIND, budget="&" * 80)
+    service.join(game.id, 2, "<" * 120)
+    service.profile(game.id, 2, wishes="<" * 2000, avoid="&" * 2000)
+    service.run_draw(game.id, 1)
+    with service.sessions() as db:
+        jobs = db.scalars(select(Delivery).where(Delivery.key.like(f"draw:{game.id}:%"))).all()
+        assert len(jobs) == 2
+        assert all(len(job.text) <= 4096 for job in jobs)
