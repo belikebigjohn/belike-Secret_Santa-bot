@@ -1,8 +1,7 @@
 import secrets
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlparse
-from zoneinfo import ZoneInfo
 
 from alembic import command
 from alembic.config import Config
@@ -22,7 +21,6 @@ from santa.models import (
     Mode,
     Question,
     QuestionMute,
-    ReminderPreference,
     ReplacementInvite,
     User,
     utcnow,
@@ -54,7 +52,7 @@ class Service:
 
     def ensure_user(self, user_id: int, name: str) -> None:
         with self.sessions.begin() as db:
-            self.user(db, user_id, name)
+            self.user(db, user_id, name).blocked = False
 
     @staticmethod
     def user(db: Session, user_id: int, name: str) -> User:
@@ -77,7 +75,7 @@ class Service:
                     shipping_deadline: datetime | None = None,
                     celebration_at: datetime | None = None,
                     timezone: str = "Europe/Moscow", max_members: int | None = None,
-                    approval_required: bool = False, team_policy: str = "mixed",
+                    approval_required: bool = False,
                     draft: bool = False) -> Game:
         if not title.strip():
             raise ValueError("Укажите название игры")
@@ -88,14 +86,12 @@ class Service:
         self._validate_dates(date_values)
         if max_members is not None and max_members < (1 if mode == Mode.HOST else 2):
             raise ValueError("Слишком маленький лимит участников")
-        if team_policy not in {"mixed", "within", "cross"}:
-            raise ValueError("Неизвестное правило команд")
         with self.sessions.begin() as db:
             self.user(db, host_id, host_name)
             game = Game(host_id=host_id, title=title.strip()[:120], description=description[:2000],
                         mode=mode.value, budget=budget[:80], token=secrets.token_urlsafe(24),
                         timezone=timezone, max_members=max_members,
-                        approval_required=approval_required, team_policy=team_policy,
+                        approval_required=approval_required,
                         status="draft" if draft else "registration",
                         **date_values)
             db.add(game)
@@ -107,21 +103,6 @@ class Service:
     def game_by_token(self, token: str) -> Game | None:
         with self.sessions() as db:
             return db.scalar(select(Game).where(Game.token == token, Game.status != "draft"))
-
-    def clone_game(self, game_id: int, host_id: int) -> Game:
-        with self.sessions() as db:
-            source = self._game(db, game_id)
-            self._require_host(source, host_id)
-            host = db.get(User, host_id)
-            values = (source.title, Mode(source.mode), source.budget, source.description,
-                      source.rules, source.cover_file_id, source.max_members,
-                      source.approval_required, source.team_policy, host.name)
-        title, mode, budget, description, rules, cover, maximum, approval, policy, host_name = values
-        clone = self.create_game(host_id, host_name, title, mode, budget=budget,
-                                 description=description, max_members=maximum,
-                                 approval_required=approval, team_policy=policy, draft=True)
-        self.edit_game(clone.id, host_id, rules=rules, cover_file_id=cover)
-        return self.game(clone.id)
 
     def publish_game(self, game_id: int, host_id: int) -> None:
         with self.sessions.begin() as db:
@@ -316,37 +297,6 @@ class Service:
                 raise InvalidState("После жеребьёвки настройку менять нельзя")
             game.approval_required = enabled
 
-    def set_team_policy(self, game_id: int, host_id: int, policy: str) -> None:
-        if policy not in {"mixed", "within", "cross"}:
-            raise ValueError("Неизвестное правило команд")
-        with self.sessions.begin() as db:
-            game = self._game(db, game_id, lock=True)
-            self._require_host(game, host_id)
-            if game.status not in {"draft", "registration"}:
-                raise InvalidState("После жеребьёвки настройку менять нельзя")
-            game.team_policy = policy
-
-    def set_advent_enabled(self, game_id: int, host_id: int, enabled: bool) -> None:
-        with self.sessions.begin() as db:
-            game = self._game(db, game_id, lock=True)
-            self._require_host(game, host_id)
-            if game.status not in {"draft", "registration", "drawn"}:
-                raise InvalidState("Игра уже завершена")
-            game.advent_enabled = enabled
-
-    def set_member_team(self, game_id: int, host_id: int, user_id: int, team: str) -> None:
-        if len(team.strip()) > 80:
-            raise ValueError("Название команды слишком длинное")
-        with self.sessions.begin() as db:
-            game = self._game(db, game_id, lock=True)
-            self._require_manager(db, game, host_id)
-            if game.status != "registration":
-                raise InvalidState("После жеребьёвки команды менять нельзя")
-            member = db.scalar(select(Member).where(Member.game_id == game_id, Member.user_id == user_id))
-            if member is None:
-                raise ValueError("Участник не найден")
-            member.team = team.strip()
-
     def review_member(self, game_id: int, host_id: int, user_id: int, approve: bool) -> None:
         with self.sessions.begin() as db:
             game = self._game(db, game_id, lock=True)
@@ -481,7 +431,7 @@ class Service:
                 raise InvalidState("Участник назначения не найден")
             self.user(db, user_id, name)
             db.add(Member(game_id=game.id, user_id=user_id, nickname=name[:120],
-                          team=leaver.team, approved=True))
+                          approved=True))
             outgoing.giver_id = user_id
             incoming.receiver_id = user_id
             questions = list(db.scalars(select(Question).where(Question.game_id == game.id,
@@ -527,22 +477,6 @@ class Service:
                             user_id=leaver.user_id,
                             text=f"🔄 Вы выбыли из игры «{game.title}». Старое назначение больше не действует."))
             return game.id
-
-    def set_marketing(self, user_id: int, enabled: bool) -> None:
-        with self.sessions.begin() as db:
-            user = db.get(User, user_id)
-            if user is None:
-                raise AccessDenied("Сначала откройте /start")
-            user.marketing_opt_in = enabled
-            if not enabled:
-                for job in db.scalars(select(Delivery).where(Delivery.user_id == user_id,
-                    Delivery.state == "pending", Delivery.key.like("broadcast:%"))):
-                    job.state = "cancelled"
-
-    def marketing_enabled(self, user_id: int) -> bool:
-        with self.sessions() as db:
-            user = db.get(User, user_id)
-            return bool(user and user.marketing_opt_in)
 
     def ask_receiver(self, game_id: int, giver_id: int, question: str) -> int:
         question = question.strip()
@@ -625,41 +559,6 @@ class Service:
                 raise AccessDenied("Подтверждение недоступно")
             member.received = True
 
-    def set_reminders(self, user_id: int, enabled: bool) -> None:
-        with self.sessions.begin() as db:
-            user = db.get(User, user_id)
-            if user is None:
-                raise AccessDenied("Сначала откройте /start")
-            user.reminders_opt_in = enabled
-            if not enabled:
-                for job in db.scalars(select(Delivery).where(
-                    Delivery.user_id == user_id, Delivery.state == "pending",
-                    (Delivery.key.like("reminder:%")) | (Delivery.key.like("daily:%")))):
-                    job.state = "cancelled"
-
-    def daily_reminders_enabled(self, user_id: int) -> bool:
-        with self.sessions() as db:
-            preference = db.get(ReminderPreference, user_id)
-            return bool(preference and preference.daily_gift)
-
-    def set_daily_reminders(self, user_id: int, enabled: bool) -> None:
-        with self.sessions.begin() as db:
-            user = db.get(User, user_id)
-            if user is None:
-                raise AccessDenied("Сначала откройте /start")
-            preference = db.get(ReminderPreference, user_id)
-            if preference is None:
-                preference = ReminderPreference(user_id=user_id)
-                db.add(preference)
-            preference.daily_gift = enabled
-            if enabled:
-                user.reminders_opt_in = True
-            else:
-                for job in db.scalars(select(Delivery).where(
-                    Delivery.user_id == user_id, Delivery.state == "pending",
-                    Delivery.key.like("daily:%"))):
-                    job.state = "cancelled"
-
     def add_exclusion(self, game_id: int, host_id: int, giver_id: int, receiver_id: int) -> None:
         if giver_id == receiver_id:
             raise ValueError("Нельзя запретить пару участника с самим собой")
@@ -685,14 +584,8 @@ class Service:
             members = list(db.scalars(select(Member).where(Member.game_id == game_id)))
             if any(not member.approved for member in members):
                 raise InvalidState("Сначала обработайте все заявки на участие")
-            if game.team_policy != "mixed" and any(not member.team for member in members):
-                raise InvalidState("Укажите команду каждому участнику")
             exclusions = set(db.execute(select(Exclusion.giver_id, Exclusion.receiver_id)
                                         .where(Exclusion.game_id == game_id)).all())
-            if game.team_policy != "mixed":
-                exclusions.update((giver.user_id, receiver.user_id)
-                                  for giver in members for receiver in members
-                                  if (giver.team != receiver.team) == (game.team_policy == "within"))
             result = draw([m.user_id for m in members], exclusions)
             by_id = {m.user_id: m for m in members}
             for giver, receiver in result.items():
@@ -744,81 +637,6 @@ class Service:
                 Member.game_id == game_id, Member.gift_status.in_(["ready", "sent", "given"])))
             return total or 0, ready or 0
 
-    def teams(self, game_id: int, host_id: int) -> list[str]:
-        with self.sessions() as db:
-            self._require_manager(db, self._game(db, game_id), host_id)
-            return list(db.scalars(select(Member.team).where(Member.game_id == game_id,
-                                                               Member.team != "").distinct().order_by(Member.team)))
-
-    def announce(self, game_id: int, host_id: int, text: str,
-                 due_at: datetime | None = None, audience: str = "all",
-                 team: str = "") -> int:
-        if not text.strip() or len(text) > 3000:
-            raise ValueError("Сообщение должно быть от 1 до 3000 символов")
-        if due_at is not None and due_at <= utcnow():
-            raise ValueError("Время отправки должно быть в будущем")
-        if audience not in {"all", "unready", "team"} or (audience == "team" and not team):
-            raise ValueError("Выберите получателей объявления")
-        with self.sessions.begin() as db:
-            game = self._game(db, game_id)
-            self._require_manager(db, game, host_id)
-            if audience == "unready" and game.status != "drawn":
-                raise InvalidState("Выбор по готовности доступен после жеребьёвки")
-            statement = select(Member).where(Member.game_id == game_id, Member.approved.is_(True))
-            if audience == "unready":
-                statement = statement.where(Member.gift_status.not_in(["ready", "sent", "given"]))
-            elif audience == "team":
-                statement = statement.where(Member.team == team)
-            members = list(db.scalars(statement))
-            if not members:
-                raise ValueError("В выбранной группе нет участников")
-            batch = secrets.token_hex(8)
-            for member in members:
-                db.add(Delivery(key=f"announcement:{game_id}:{batch}:{member.user_id}",
-                                user_id=member.user_id, text=f"📣 {game.title}\n{text.strip()}",
-                                due_at=due_at or utcnow()))
-            return len(members)
-
-    def schedule_reminders(self, now: datetime | None = None) -> int:
-        now = now or utcnow()
-        local_now = now.replace(tzinfo=UTC).astimezone(ZoneInfo("Europe/Moscow"))
-        count = 0
-        with self.sessions.begin() as db:
-            games = db.scalars(select(Game).where(Game.reminders_enabled.is_(True),
-                                                   Game.status.in_(["registration", "drawn"]))).all()
-            for game in games:
-                events = [("registration", game.registration_deadline, "⏰ Регистрация скоро закроется"),
-                          ("gift", game.gift_deadline, "🎁 Скоро срок подготовки подарка"),
-                          ("celebration", game.celebration_at, "🎄 Скоро вручение подарков")]
-                for kind, deadline, message in events:
-                    if not deadline or not deadline - timedelta(days=1) <= now < deadline:
-                        continue
-                    if kind == "registration" and game.status != "registration":
-                        continue
-                    for user_id in db.scalars(select(Member.user_id).where(Member.game_id == game.id)):
-                        user = db.get(User, user_id)
-                        key = f"reminder:{game.id}:{kind}:{user_id}"
-                        if user.reminders_opt_in and not db.scalar(select(Delivery.id).where(Delivery.key == key)):
-                            db.add(Delivery(key=key, user_id=user_id, text=f"{message} в игре «{game.title}»."))
-                            count += 1
-                if game.status != "drawn" or not game.gift_deadline or game.gift_deadline <= now:
-                    continue
-                if local_now.hour < 9:
-                    continue
-                for member in db.scalars(select(Member).where(Member.game_id == game.id)):
-                    if member.gift_status in {"ready", "sent", "given"}:
-                        continue
-                    user = db.get(User, member.user_id)
-                    preference = db.get(ReminderPreference, member.user_id)
-                    if not user.reminders_opt_in or not preference or not preference.daily_gift:
-                        continue
-                    key = f"daily:{game.id}:{local_now:%Y-%m-%d}:{member.user_id}"
-                    if not db.scalar(select(Delivery.id).where(Delivery.key == key)):
-                        db.add(Delivery(key=key, user_id=member.user_id,
-                                        text=f"🎁 Напоминание: подготовьте подарок для игры «{game.title}»."))
-                        count += 1
-        return count
-
     def is_owner(self, user_id: int) -> bool:
         return user_id in self.owner_ids
 
@@ -835,8 +653,8 @@ class Service:
                     Game.status == "drawn")) or 0,
                 "finished": db.scalar(select(func.count()).select_from(Game).where(
                     Game.status == "finished")) or 0,
-                "subscribers": db.scalar(select(func.count()).select_from(User).where(
-                    User.marketing_opt_in.is_(True))) or 0,
+                "reachable_users": db.scalar(select(func.count()).select_from(User).where(
+                    User.blocked.is_(False))) or 0,
                 "blocked_users": db.scalar(select(func.count()).select_from(User).where(
                     User.blocked.is_(True))) or 0,
                 "deliveries_sent": db.scalar(select(func.count()).select_from(Delivery).where(
@@ -850,30 +668,14 @@ class Service:
             }
 
     @staticmethod
-    def _broadcast_recipients(db: Session, segment: str, now: datetime) -> list[int]:
-        if segment not in {"all", "recent", "hosts", "active", "finished"}:
-            raise ValueError("Неизвестная аудитория")
-        users = list(db.scalars(select(User).where(User.marketing_opt_in.is_(True),
-                                                  User.blocked.is_(False))))
-        if segment == "all":
-            return [user.id for user in users]
-        if segment == "recent":
-            return [user.id for user in users if user.created_at and
-                    user.created_at >= now - timedelta(days=30)]
-        if segment == "hosts":
-            selected = set(db.scalars(select(Game.host_id)))
-        else:
-            status = ["registration", "drawn"] if segment == "active" else ["finished"]
-            selected = set(db.scalars(select(Member.user_id).join(Game, Game.id == Member.game_id)
-                                      .where(Game.status.in_(status))))
-            selected.update(db.scalars(select(Game.host_id).where(Game.status.in_(status))))
-        return [user.id for user in users if user.id in selected]
+    def _broadcast_recipients(db: Session) -> list[int]:
+        return list(db.scalars(select(User.id).where(User.blocked.is_(False))))
 
-    def broadcast_audience_count(self, owner_id: int, segment: str) -> int:
+    def broadcast_audience_count(self, owner_id: int) -> int:
         if not self.is_owner(owner_id):
             raise AccessDenied("Доступ закрыт")
         with self.sessions() as db:
-            return len(self._broadcast_recipients(db, segment, utcnow()))
+            return len(self._broadcast_recipients(db))
 
     @staticmethod
     def validate_broadcast(content: str, media_type: str = "", media_file_id: str = "",
@@ -892,7 +694,7 @@ class Service:
                             not urlparse(button_url).netloc):
             raise ValueError("Кнопке нужна корректная ссылка HTTP(S)")
 
-    def create_broadcast(self, owner_id: int, content: str, segment: str,
+    def create_broadcast(self, owner_id: int, content: str,
                          due_at: datetime | None = None, *, media_type: str = "",
                          media_file_id: str = "", button_text: str = "",
                          button_url: str = "") -> tuple[int, int]:
@@ -904,10 +706,10 @@ class Service:
         if due_at is not None and due_at <= now:
             raise ValueError("Дата отправки должна быть в будущем")
         with self.sessions.begin() as db:
-            recipients = self._broadcast_recipients(db, segment, now)
+            recipients = self._broadcast_recipients(db)
             if not recipients:
-                raise ValueError("В выбранной аудитории нет подписчиков")
-            campaign = Broadcast(owner_id=owner_id, text=content, segment=segment,
+                raise ValueError("Пользователей для рассылки пока нет")
+            campaign = Broadcast(owner_id=owner_id, text=content, segment="all",
                                  due_at=due_at or now, media_type=media_type,
                                  media_file_id=media_file_id, button_text=button_text,
                                  button_url=button_url)
@@ -915,7 +717,7 @@ class Service:
             db.flush()
             for recipient in recipients:
                 db.add(Delivery(key=f"broadcast:{campaign.id}:{recipient}", user_id=recipient,
-                                text=f"📬 Новости бота\n\n{content}\n\nОтключить новости: /start → Мои напоминания.",
+                                text=f"📬 Новости бота\n\n{content}",
                                 due_at=campaign.due_at, media_type=media_type,
                                 media_file_id=media_file_id, button_text=button_text,
                                 button_url=button_url))

@@ -94,16 +94,12 @@ async def worker(service: Service, bot: Bot) -> None:
     # A process may stop after Telegram accepts a message but before its DB commit.
     # A stale claim is retried; this narrow case can duplicate a message.
     recover_stale(service)
-    next_reminder_check = 0.0
     next_recovery_check = 0.0
     while True:
         try:
             if time.monotonic() >= next_recovery_check:
                 recover_stale(service)
                 next_recovery_check = time.monotonic() + 60
-            if time.monotonic() >= next_reminder_check:
-                service.schedule_reminders()
-                next_reminder_check = time.monotonic() + 60
             if not await deliver_once(service, bot):
                 await asyncio.sleep(5)
         except Exception:

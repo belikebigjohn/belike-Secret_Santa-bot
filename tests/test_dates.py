@@ -1,10 +1,8 @@
-from datetime import UTC, datetime
-from zoneinfo import ZoneInfo
+from datetime import datetime
 
 import pytest
 
 from santa.bot import display_date, kb, local_date, page_buttons, page_slice
-from santa.festive import advent_card, days_until, new_year_days
 from santa.formatting import limited_html, profile_link
 
 
@@ -41,12 +39,3 @@ def test_html_snippet_keeps_entities_intact():
     assert len(result) <= 1000
     assert result.endswith("…")
     assert result.count("&lt;") == 249
-
-
-def test_festive_cards_and_countdown_are_stable_by_moscow_day():
-    moscow = ZoneInfo("Europe/Moscow")
-    now = datetime(2026, 12, 30, 12, tzinfo=moscow)
-    assert new_year_days(now) == 2
-    target = datetime(2027, 1, 1, 15, tzinfo=UTC).replace(tzinfo=None)
-    assert days_until(target, now) == 2
-    assert advent_card(7, now) == advent_card(7, now.replace(hour=23))

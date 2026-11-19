@@ -1,10 +1,10 @@
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 
 import pytest
 from sqlalchemy import select
 
 from santa.draw import ImpossibleDraw, draw
-from santa.models import Assignment, Delivery, Mode, utcnow
+from santa.models import Assignment, Delivery, Mode, User, utcnow
 from santa.service import AccessDenied, InvalidState, Service
 from santa.worker import recover_stale
 
@@ -53,27 +53,14 @@ def test_constraints_and_impossible_draw(service):
         draw([1, 2], {(1, 2)})
 
 
-def test_game_isolation_and_broadcast_auth(service):
+def test_game_isolation_and_manager_auth(service):
     first = game_with_players(service)
     second = service.create_game(10, "Other Host", "Other", Mode.HOST)
     service.join(second.id, 11, "Someone")
     service.join(second.id, 12, "Someone else")
     assert service.assignment(second.id, 2) is None
     with pytest.raises(AccessDenied):
-        service.announce(second.id, 1, "Hello")
-    with pytest.raises(AccessDenied):
         service.members(first.id, 10)
-
-
-def test_reminders_idempotent_and_persistent(service):
-    service.create_game(1, "Host", "Holiday", Mode.BLIND,
-                        registration_deadline=utcnow() + timedelta(hours=12))
-    assert service.schedule_reminders() == 1
-    assert service.schedule_reminders() == 0
-    restarted = Service(str(service.engine.url))
-    assert restarted.schedule_reminders() == 0
-    with restarted.sessions() as db:
-        assert len(db.scalars(select(Delivery)).all()) == 1
 
 
 def test_owner_allowlist(service):
@@ -102,13 +89,6 @@ def test_profile_is_scoped_to_member(service):
         service.profile(game.id, 99, wishes="Чужая анкета")
 
 
-def test_announcement_queues_only_own_members(service):
-    game = game_with_players(service)
-    assert service.announce(game.id, 1, "Привет") == 4
-    with service.sessions() as db:
-        jobs = db.scalars(select(Delivery)).all()
-        assert {job.user_id for job in jobs} == {1, 2, 3, 4}
-
 
 def test_change_mode_and_budget_before_draw(service):
     game = game_with_players(service)
@@ -122,54 +102,6 @@ def test_change_mode_and_budget_before_draw(service):
     with pytest.raises(InvalidState):
         service.set_budget(game.id, 1, "5000 ₽")
 
-
-def test_reminder_opt_out(service):
-    game = service.create_game(1, "Host", "Holiday", Mode.BLIND,
-                               registration_deadline=utcnow() + timedelta(hours=12))
-    service.join(game.id, 2, "Two")
-    service.set_reminders(2, False)
-    assert service.schedule_reminders() == 1
-    with service.sessions() as db:
-        assert {job.user_id for job in db.scalars(select(Delivery))} == {1}
-
-
-def test_opt_out_cancels_pending_reminder(service):
-    service.create_game(1, "Host", "Holiday", Mode.BLIND,
-                        registration_deadline=utcnow() + timedelta(hours=12))
-    service.schedule_reminders()
-    service.set_reminders(1, False)
-    with service.sessions() as db:
-        assert db.scalar(select(Delivery)).state == "cancelled"
-
-
-def test_daily_gift_reminder_once_per_day_until_ready(service):
-    now = datetime.now().replace(hour=12, minute=0, second=0, microsecond=0).astimezone(UTC).replace(tzinfo=None)
-    game = service.create_game(1, "Host", "Holiday", Mode.BLIND,
-                               gift_deadline=now + timedelta(days=5))
-    service.join(game.id, 2, "Two")
-    service.join(game.id, 3, "Three")
-    service.run_draw(game.id, 1)
-    service.set_daily_reminders(2, True)
-    assert service.daily_reminders_enabled(2)
-    assert service.schedule_reminders(now) == 1
-    assert service.schedule_reminders(now) == 0
-    service.set_gift_status(game.id, 2, "ready")
-    assert service.schedule_reminders(now + timedelta(days=1)) == 0
-
-
-def test_daily_toggle_cancels_waiting_job(service):
-    now = datetime.now().replace(hour=12, minute=0, second=0, microsecond=0).astimezone(UTC).replace(tzinfo=None)
-    game = service.create_game(1, "Host", "Holiday", Mode.HOST,
-                               gift_deadline=now + timedelta(days=5))
-    service.join(game.id, 2, "Two")
-    service.join(game.id, 3, "Three")
-    service.run_draw(game.id, 1)
-    service.set_daily_reminders(2, True)
-    service.schedule_reminders(now)
-    service.set_daily_reminders(2, False)
-    with service.sessions() as db:
-        job = db.scalar(select(Delivery).where(Delivery.key.like("daily:%")))
-        assert job.state == "cancelled"
 
 
 def test_questions_are_anonymous_and_answer_is_scoped(service):
@@ -205,7 +137,6 @@ def test_lifecycle_and_transfer(service):
         service.run_draw(game.id, 1)
     service.run_draw(game.id, 2)
     question_id = service.ask_receiver(game.id, 3, "Чай или кофе?")
-    service.announce(game.id, 2, "До встречи", due_at=utcnow() + timedelta(days=2))
     with pytest.raises(InvalidState):
         service.edit_game(game.id, 2, title="Late")
     with pytest.raises(InvalidState):
@@ -223,7 +154,6 @@ def test_lifecycle_and_transfer(service):
     with service.sessions() as db:
         assert db.scalars(select(Assignment).where(Assignment.game_id == game.id)).all() == []
         assert db.scalars(select(Delivery).where(Delivery.key == f"question:{question_id}")).all() == []
-        assert db.scalars(select(Delivery).where(Delivery.key.like(f"announcement:{game.id}:%"))).all() == []
 
 
 def test_exclusion_removal_and_owner_stats(service):
@@ -236,16 +166,6 @@ def test_exclusion_removal_and_owner_stats(service):
         service.owner_stats(1)
     assert service.owner_stats(99)["games"] == 1
 
-
-def test_scheduled_announcement_waits_for_due_time(service):
-    game = game_with_players(service)
-    due = utcnow() + timedelta(days=2)
-    assert service.announce(game.id, 1, "Встречаемся у ёлки", due_at=due) == 4
-    with service.sessions() as db:
-        jobs = db.scalars(select(Delivery)).all()
-        assert all(job.due_at == due for job in jobs)
-    with pytest.raises(ValueError):
-        service.announce(game.id, 1, "Поздно", due_at=utcnow() - timedelta(seconds=1))
 
 
 def test_draw_notification_links_to_receiver(service):
@@ -340,30 +260,6 @@ def test_capacity_and_approval_gate_draw(service):
     assert len(service.run_draw(game.id, 1)) == 2
 
 
-def test_team_policy_limits_assignments(service):
-    game = service.create_game(1, "Host", "Branches", Mode.HOST, team_policy="within")
-    for user_id in range(2, 6):
-        service.join(game.id, user_id, str(user_id))
-    with pytest.raises(InvalidState):
-        service.run_draw(game.id, 1)
-    for user_id in range(2, 6):
-        service.set_member_team(game.id, 1, user_id, "North" if user_id < 4 else "South")
-    result = service.run_draw(game.id, 1)
-    assert {2, 3} == {result[2], result[3]}
-    assert {4, 5} == {result[4], result[5]}
-
-
-def test_eighty_player_cross_team_draw_is_bijective(service):
-    game = service.create_game(1, "Host", "Two departments", Mode.HOST,
-                               team_policy="cross", max_members=80)
-    for user_id in range(2, 82):
-        service.join(game.id, user_id, f"Player {user_id}")
-        service.set_member_team(game.id, 1, user_id, "North" if user_id < 42 else "South")
-    result = service.run_draw(game.id, 1)
-    assert len(result) == 80
-    assert set(result) == set(result.values()) == set(range(2, 82))
-    assert all((giver < 42) != (receiver < 42) for giver, receiver in result.items())
-
 
 def test_registration_dates_and_capacity_edits(service):
     now = utcnow()
@@ -383,37 +279,16 @@ def test_registration_dates_and_capacity_edits(service):
         service.set_max_members(game.id, 1, 1)
 
 
-def test_segmented_announcements_only_reach_intended_members(service):
-    game = service.create_game(1, "Host", "Teams", Mode.HOST)
-    for user_id in (2, 3, 4, 5):
-        service.join(game.id, user_id, str(user_id))
-        service.set_member_team(game.id, 1, user_id, "North" if user_id < 4 else "South")
-    assert service.teams(game.id, 1) == ["North", "South"]
-    assert service.announce(game.id, 1, "Hello North", audience="team", team="North") == 2
-    with pytest.raises(InvalidState):
-        service.announce(game.id, 1, "Reminder", audience="unready")
-    service.run_draw(game.id, 1)
-    service.set_gift_status(game.id, 2, "ready")
-    assert service.announce(game.id, 1, "Prepare gifts", audience="unready") == 3
-    with service.sessions() as db:
-        north = db.scalars(select(Delivery).where(Delivery.text.contains("Hello North"))).all()
-        unready = db.scalars(select(Delivery).where(Delivery.text.contains("Prepare gifts"))).all()
-        assert {job.user_id for job in north} == {2, 3}
-        assert {job.user_id for job in unready} == {3, 4, 5}
-
 
 def test_helper_can_manage_logistics_but_not_see_secret_pairs(service):
     game = game_with_players(service)
     service.set_helper(game.id, 1, 2, True)
     assert service.is_helper(game.id, 2)
     assert len(service.members(game.id, 2)) == 4
-    service.set_member_team(game.id, 2, 3, "North")
-    assert service.member(game.id, 3).team == "North"
     with pytest.raises(AccessDenied):
         service.run_draw(game.id, 2)
     service.run_draw(game.id, 1)
     assert service.progress(game.id, 2)[0] == 4
-    assert service.announce(game.id, 2, "Reminder") == 4
     with pytest.raises(AccessDenied):
         service.all_assignments(game.id, 2)
     with pytest.raises(AccessDenied):
@@ -453,19 +328,10 @@ def test_replacement_requires_consent_and_preserves_matching(service):
         service.accept_replacement(token, 6, "Too late")
 
 
-def test_draft_copy_and_publish(service):
+def test_draft_and_publish(service):
     now = utcnow()
-    source = service.create_game(1, "Host", "Original", Mode.BLIND,
-                                 budget="3000 ₽", description="Party",
-                                 registration_deadline=now + timedelta(days=2),
-                                 gift_deadline=now + timedelta(days=10),
-                                 celebration_at=now + timedelta(days=12))
-    service.edit_game(source.id, 1, rules="No spoilers")
-    clone = service.clone_game(source.id, 1)
+    clone = service.create_game(1, "Host", "Draft", Mode.BLIND, draft=True)
     assert clone.status == "draft"
-    assert clone.token != source.token
-    assert clone.rules == "No spoilers"
-    assert clone.registration_deadline is None
     assert service.game_by_token(clone.token) is None
     with pytest.raises(InvalidState):
         service.join(clone.id, 2, "Two")
@@ -479,48 +345,47 @@ def test_draft_copy_and_publish(service):
     service.join(clone.id, 2, "Two")
 
 
-def test_owner_broadcast_requires_consent_and_can_be_cancelled(service):
+def test_owner_broadcast_reaches_all_started_users_and_can_be_cancelled(service):
     service.ensure_user(99, "Owner")
     game = service.create_game(1, "Host", "Holiday", Mode.HOST)
     for user_id in (2, 3):
         service.join(game.id, user_id, str(user_id))
-    service.set_marketing(1, True)
-    service.set_marketing(2, True)
-    assert service.broadcast_audience_count(99, "all") == 2
-    assert service.broadcast_audience_count(99, "hosts") == 1
-    assert service.broadcast_audience_count(99, "active") == 2
+    assert service.broadcast_audience_count(99) == 4
+    with service.sessions.begin() as db:
+        db.get(User, 3).blocked = True
+    assert service.broadcast_audience_count(99) == 3
+    service.ensure_user(3, "Three returned")
+    assert service.broadcast_audience_count(99) == 4
     with pytest.raises(AccessDenied):
-        service.create_broadcast(1, "Unauthorized", "all")
+        service.create_broadcast(1, "Unauthorized")
     campaign_id, count = service.create_broadcast(
-        99, "News", "all", due_at=utcnow() + timedelta(days=2))
-    assert count == 2
-    assert service.broadcast_stats(99, campaign_id)["pending"] == 2
-    service.set_marketing(2, False)
-    assert service.broadcast_stats(99, campaign_id)["cancelled"] == 1
-    assert service.cancel_broadcast(99, campaign_id) == 1
+        99, "News", due_at=utcnow() + timedelta(days=2))
+    assert count == 4
+    assert service.broadcast_stats(99, campaign_id)["pending"] == 4
+    assert service.cancel_broadcast(99, campaign_id) == 4
     assert service.broadcast_stats(99, campaign_id)["pending"] == 0
     with service.sessions() as db:
         jobs = db.scalars(select(Delivery).where(Delivery.key.like(f"broadcast:{campaign_id}:%"))).all()
-        assert {job.user_id for job in jobs} == {1, 2}
+        assert {job.user_id for job in jobs} == {1, 2, 3, 99}
         assert all(job.state == "cancelled" for job in jobs)
+        assert all("Отключить новости" not in job.text for job in jobs)
 
 
 def test_broadcast_media_and_button_payload(service):
     service.ensure_user(99, "Owner")
     service.ensure_user(1, "Subscriber")
-    service.set_marketing(1, True)
     with pytest.raises(ValueError):
-        service.create_broadcast(99, "Hello", "all", media_type="photo")
+        service.create_broadcast(99, "Hello", media_type="photo")
     with pytest.raises(ValueError):
-        service.create_broadcast(99, "Hello", "all", button_text="Open",
+        service.create_broadcast(99, "Hello", button_text="Open",
                                  button_url="javascript:alert(1)")
     with pytest.raises(ValueError):
-        service.create_broadcast(99, "x" * 901, "all", media_type="photo",
+        service.create_broadcast(99, "x" * 901, media_type="photo",
                                  media_file_id="telegram-photo")
     campaign_id, count = service.create_broadcast(
-        99, "Hello", "all", media_type="photo", media_file_id="telegram-photo",
+        99, "Hello", media_type="photo", media_file_id="telegram-photo",
         button_text="Open", button_url="https://example.com/path")
-    assert count == 1
+    assert count == 2
     with service.sessions() as db:
         job = db.scalar(select(Delivery).where(Delivery.key == f"broadcast:{campaign_id}:1"))
         assert job.media_type == "photo"
@@ -542,13 +407,6 @@ def test_recover_stale_delivery_preserves_recent_claim(service):
     with service.sessions() as db:
         states = {job.key: job.state for job in db.scalars(select(Delivery))}
     assert states == {"old-claim": "pending", "recent-claim": "sending"}
-
-
-def test_advent_setting_does_not_affect_draw(service):
-    game = game_with_players(service)
-    service.set_advent_enabled(game.id, 1, True)
-    assert service.game(game.id).advent_enabled
-    assert len(service.run_draw(game.id, 1)) == 4
 
 
 def test_anonymous_questions_rate_limit_and_report_keep_sender_secret(service):
